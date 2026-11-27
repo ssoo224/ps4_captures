@@ -242,17 +242,17 @@ class AppState(private val ctx: Context) {
     private var proxyWake: PowerManager.WakeLock? = null
     private var proxyWifi: WifiManager.WifiLock? = null
 
-    fun setMode(v: Int) {
+    fun updateMode(v: Int) {
         mode = v
         prefs.edit().putInt("mode", v).apply()
     }
 
-    fun setNetMode(v: Int) {
+    fun updateNetMode(v: Int) {
         netMode = v
         prefs.edit().putInt("netmode", v).apply()
     }
 
-    fun setConnIdx(v: Int) {
+    fun updateConnIdx(v: Int) {
         connIdx = v
         prefs.edit().putInt("connidx", v).apply()
     }
@@ -1545,7 +1545,7 @@ fun InstallScreen(state: AppState) {
             GlassCard {
                 Text("طريقة النقل", color = TextHi, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
                 Spacer(Modifier.height(10.dp))
-                SegPills(listOf("مباشر", "عبر التلفون (أسرع)"), state.mode) { state.setMode(it) }
+                SegPills(listOf("مباشر", "عبر التلفون (أسرع)"), state.mode) { state.updateMode(it) }
                 Spacer(Modifier.height(8.dp))
                 Text(
                     if (state.mode == 0)
@@ -1560,7 +1560,7 @@ fun InstallScreen(state: AppState) {
                     Spacer(Modifier.height(16.dp))
                     Text("مصدر الإنترنت", color = TextHi, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
-                    SegPills(listOf("Wi-Fi", "داتا الموبايل", "الاثنين معًا"), state.netMode) { state.setNetMode(it) }
+                    SegPills(listOf("Wi-Fi", "داتا الموبايل", "الاثنين معًا"), state.netMode) { state.updateNetMode(it) }
                     if (state.netMode != 0) {
                         Spacer(Modifier.height(8.dp))
                         Text(
@@ -1573,7 +1573,7 @@ fun InstallScreen(state: AppState) {
                     Spacer(Modifier.height(16.dp))
                     Text("عدد الاتصالات المتوازية", color = TextHi, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
-                    SegPills(CONN_OPTIONS.map { "$it" }, state.connIdx) { state.setConnIdx(it) }
+                    SegPills(CONN_OPTIONS.map { "$it" }, state.connIdx) { state.updateConnIdx(it) }
                 }
             }
 
