@@ -163,7 +163,10 @@ data class ProxyView(
     val speed: Long = 0,
     val nets: String = "",
     val requests: Long = 0,
-    val error: String = ""
+    val error: String = "",
+    val fetchSpeed: Long = 0,
+    val ready: Int = 0,
+    val window: Int = 0
 )
 
 class MainActivity : ComponentActivity() {
@@ -229,7 +232,7 @@ class AppState(private val ctx: Context) {
     var link by mutableStateOf("")
     var mode by mutableIntStateOf(prefs.getInt("mode", 1))
     var netMode by mutableIntStateOf(prefs.getInt("netmode", 0))
-    var connIdx by mutableIntStateOf(prefs.getInt("connidx", 1))
+    var connIdx by mutableIntStateOf(prefs.getInt("connidx", 3))
     var installPort by mutableStateOf(prefs.getString("iport", "12800") ?: "12800")
     var installBusy by mutableStateOf(false)
     var installOk by mutableStateOf<Boolean?>(null)
@@ -392,13 +395,14 @@ class AppState(private val ctx: Context) {
     private fun startPoll() {
         pollJob?.cancel()
         pollJob = scope.launch {
-            val history = ArrayDeque<Pair<Long, Long>>()
+            val history = ArrayDeque<Triple<Long, Long, Long>>()
             while (proxyRunning) {
                 delay(500)
                 val srv = proxy ?: break
                 val served = srv.served.get()
+                val fetched = srv.fetchedTotal()
                 val now = SystemClock.elapsedRealtime()
-                history.addLast(now to served)
+                history.addLast(Triple(now, served, fetched))
                 while (history.size > 2 && now - history.first().first > 4000L) {
                     history.removeFirst()
                 }
@@ -409,9 +413,15 @@ class AppState(private val ctx: Context) {
                 } else {
                     0L
                 }
+                val fetchSpeed = if (history.size >= 2) {
+                    ((fetched - first.third) * 1000.0 / dt).toLong().coerceAtLeast(0L)
+                } else {
+                    0L
+                }
                 proxyView = ProxyView(
                     srv.origin?.name ?: "", served, srv.total, speed, srv.liveLabels(),
-                    srv.requests.get(), srv.lastError
+                    srv.requests.get(), srv.lastError,
+                    fetchSpeed, srv.readyBlocks(), srv.windowBlocks()
                 )
             }
         }
@@ -1757,6 +1767,13 @@ private fun ProxyStatusCard(state: AppState) {
             "طلبات الـ PS4 للسيرفر: ${v.requests}",
             color = TextLo,
             fontSize = 12.sp
+        )
+        Text(
+            "من الإنترنت: " + (if (v.fetchSpeed >= 1024) fmtSize(v.fetchSpeed) + "/s" else "—") +
+                " · جاهز بالذاكرة: ${v.ready}/${v.window}",
+            color = TextLo,
+            fontSize = 12.sp,
+            style = TextStyle(textDirection = TextDirection.Content)
         )
         if (v.error.isNotEmpty()) {
             Text(

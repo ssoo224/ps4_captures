@@ -184,6 +184,15 @@ class ProxyServer(
 
     val total: Long get() = origin?.size ?: 0L
 
+    /** مجموع ما سُحب من الإنترنت (يشمل أي تكرار) */
+    fun fetchedTotal(): Long = slots.sumOf { it.bytes.get() }
+
+    /** كتل جاهزة بالذاكرة لم تُرسل للـ PS4 بعد */
+    fun readyBlocks(): Int = blocks.values.count { it.done }
+
+    /** كل الكتل الجارية والجاهزة بالنافذة الحالية */
+    fun windowBlocks(): Int = blocks.size
+
     fun liveLabels(): String {
         val nets = slots.filter { !it.dead }.joinToString(" + ") { it.label }
         return "$nets (${effectiveMax.get()})"
@@ -563,7 +572,7 @@ class ProxyServer(
                             val writtenNow = blk.append(tmp, curOffset, n)
                             curOffset += n
                             slot.bytes.addAndGet(n.toLong())
-                            if (writtenNow > curOffset + 128 * 1024) {
+                            if (writtenNow > curOffset + 512 * 1024) {
                                 // المسار البديل أسرع بوضوح، نغلق هذا الاتصال البطيء فورًا
                                 return
                             }
@@ -613,9 +622,9 @@ class ProxyServer(
     }
 
     // ───── كاش الكتل (1 MB) + كشف فوري للكتل المتأخرة ─────
-    private val blockSize = 1 * 1024 * 1024
+    private val blockSize = 3 * 1024 * 1024
     private val maxBlocks = maxOf(32, conns * 3)
-    private val ahead = minOf(conns, 12)
+    private val ahead = minOf(conns, 16)
 
     private val blocks = ConcurrentHashMap<Long, StreamBlock>()
 
@@ -672,13 +681,12 @@ class ProxyServer(
         }
     }
 
-    private fun maybeHedge(blk: StreamBlock, idx: Long, avail: Int, slowProgress: Boolean) {
-        if (blk.done || stopped || (blk.expectedSize - avail) <= 128 * 1024) return
-        val nextDone = blocks[idx + 1]?.done == true
-        if (!nextDone && !slowProgress) return
+    /** نكرر السحب فقط عند توقف حقيقي، لأن التكرار الزائد يهدر عرض حزمة الإنترنت المحدودة */
+    private fun maybeHedge(blk: StreamBlock, avail: Int, stalled: Boolean) {
+        if (!stalled || blk.done || stopped || (blk.expectedSize - avail) <= 256 * 1024) return
         val nowMs = System.currentTimeMillis()
         val prevHedge = blk.lastHedgeAtMs.get()
-        if (nowMs - prevHedge >= 1800L &&
+        if (nowMs - prevHedge >= 3000L &&
             blk.activeAttempts.get() < 2 &&
             blk.lastHedgeAtMs.compareAndSet(prevHedge, nowMs)
         ) {
@@ -713,9 +721,9 @@ class ProxyServer(
                 var avail = blk.written
                 val nowMs = System.currentTimeMillis()
                 val elapsed = nowMs - lastCheckMs
-                val slowProgress = elapsed >= 1500L && (avail - lastCheckWritten) < 350 * 1024
-                maybeHedge(blk, idx, avail, slowProgress)
-                if (elapsed >= 1500L) {
+                val stalled = elapsed >= 3000L && (avail - lastCheckWritten) < 100 * 1024
+                maybeHedge(blk, avail, stalled)
+                if (elapsed >= 3000L) {
                     lastCheckMs = nowMs
                     lastCheckWritten = avail
                 }
@@ -725,11 +733,11 @@ class ProxyServer(
                         out.flush()
                         dirty = false
                     }
-                    avail = blk.awaitAvailable(posInBlock, 1200L)
+                    avail = blk.awaitAvailable(posInBlock, 2500L)
                     if (avail <= posInBlock && !blk.done && !stopped) {
                         val ms2 = System.currentTimeMillis()
                         val prevHedge = blk.lastHedgeAtMs.get()
-                        if (ms2 - prevHedge >= 1800L &&
+                        if (ms2 - prevHedge >= 3000L &&
                             blk.activeAttempts.get() < 2 &&
                             blk.lastHedgeAtMs.compareAndSet(prevHedge, ms2)
                         ) {
