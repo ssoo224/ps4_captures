@@ -5,22 +5,23 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
-import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Size
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -62,18 +63,20 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.CloudDownload
-import androidx.compose.material.icons.rounded.ContentPaste
+import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.SportsEsports
+import androidx.compose.material.icons.rounded.Upload
 import androidx.compose.material.icons.rounded.Videocam
 import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material3.CircularProgressIndicator
@@ -111,7 +114,6 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -132,13 +134,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlin.coroutines.resume
 
 // ───────────── الألوان ─────────────
 private val Bg = Color(0xFF070B18)
@@ -151,47 +151,23 @@ private val Amber = Color(0xFFFFB020)
 private val TextHi = Color(0xFFF1F5FF)
 private val TextLo = Color(0xFF93A0C8)
 
-/** رابط مشارك من تطبيق آخر (مشاركة ← PS4 Captures) */
-var pendingShared by mutableStateOf<String?>(null)
-
-val CONN_OPTIONS = listOf(4, 8, 12, 16)
-
 data class ProxyView(
-    val name: String = "",
+    val files: List<FileProgress> = emptyList(),
     val served: Long = 0,
     val total: Long = 0,
     val speed: Long = 0,
-    val nets: String = "",
     val requests: Long = 0,
-    val error: String = "",
-    val fetchSpeed: Long = 0,
-    val ready: Int = 0,
-    val window: Int = 0
+    val error: String = ""
 )
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // نسمح بعدد أكبر من الاتصالات المفتوحة لنفس السيرفر (أسرع للسحب المتوازي)
-        System.setProperty("http.maxConnections", "64")
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         )
-        readShared(intent)
         setContent { PS4App() }
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        readShared(intent)
-    }
-
-    private fun readShared(i: Intent?) {
-        if (i != null && i.action == Intent.ACTION_SEND) {
-            pendingShared = i.getStringExtra(Intent.EXTRA_TEXT)
-        }
     }
 }
 
@@ -227,12 +203,9 @@ class AppState(private val ctx: Context) {
     val savedIp: String
         get() = prefs.getString("ip", "192.168.") ?: "192.168."
 
-    // ───── التثبيت المباشر ─────
+    // ───── نقل وتثبيت PKG من التلفون ─────
     var page by mutableIntStateOf(0)
-    var link by mutableStateOf("")
-    var mode by mutableIntStateOf(prefs.getInt("mode", 1))
-    var netMode by mutableIntStateOf(prefs.getInt("netmode", 0))
-    var connIdx by mutableIntStateOf(prefs.getInt("connidx", 3))
+    var selectedPkgs by mutableStateOf<List<LocalPkgEntry>>(emptyList())
     var installPort by mutableStateOf(prefs.getString("iport", "12800") ?: "12800")
     var installBusy by mutableStateOf(false)
     var installOk by mutableStateOf<Boolean?>(null)
@@ -241,84 +214,101 @@ class AppState(private val ctx: Context) {
     var proxyRunning by mutableStateOf(false)
     var proxyView by mutableStateOf(ProxyView())
 
-    private var proxy: ProxyServer? = null
+    private var server: LocalPkgServer? = null
     private var pollJob: Job? = null
-    private var cellCb: ConnectivityManager.NetworkCallback? = null
     private var proxyWake: PowerManager.WakeLock? = null
     private var proxyWifi: WifiManager.WifiLock? = null
-
-    fun updateMode(v: Int) {
-        mode = v
-        prefs.edit().putInt("mode", v).apply()
-    }
-
-    fun updateNetMode(v: Int) {
-        netMode = v
-        prefs.edit().putInt("netmode", v).apply()
-    }
-
-    fun updateConnIdx(v: Int) {
-        connIdx = v
-        prefs.edit().putInt("connidx", v).apply()
-    }
 
     fun setPort(p: String) {
         installPort = p.filter { it.isDigit() }.take(5)
         prefs.edit().putString("iport", installPort).apply()
     }
 
-    fun handleShared(text: String?) {
-        val m = Regex("""https?://\S+""").find(text ?: "") ?: return
-        link = m.value
-        page = 1
+    fun addPickedPkgs(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val existing = selectedPkgs.mapTo(HashSet()) { it.uri.toString() }
+        val added = ArrayList<LocalPkgEntry>()
+        var skippedNonPkg = 0
+
+        for (uri in uris) {
+            if (uri.toString() in existing) continue
+            try {
+                ctx.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+            }
+
+            var name = ""
+            var size = 0L
+            try {
+                ctx.contentResolver.query(
+                    uri,
+                    arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                    null,
+                    null,
+                    null
+                )?.use { c ->
+                    if (c.moveToFirst()) {
+                        val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        val si = c.getColumnIndex(OpenableColumns.SIZE)
+                        if (ni >= 0) name = c.getString(ni) ?: ""
+                        if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+
+            if (size <= 0L) {
+                try {
+                    ctx.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                        if (pfd.statSize > 0L) size = pfd.statSize
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
+            if (name.isBlank()) name = uri.lastPathSegment?.substringAfterLast('/') ?: "game.pkg"
+            if (!name.endsWith(".pkg", ignoreCase = true)) {
+                skippedNonPkg++
+                continue
+            }
+
+            existing.add(uri.toString())
+            added.add(LocalPkgEntry(uri, name, size))
+        }
+
+        if (added.isNotEmpty()) {
+            selectedPkgs = selectedPkgs + added
+            installOk = null
+            installMsg = null
+        }
+        if (skippedNonPkg > 0) {
+            toast("تم تجاهل $skippedNonPkg ملف لأن صيغته ليست .pkg", long = true)
+        }
+    }
+
+    fun removePkg(index: Int) {
+        if (proxyRunning || index !in selectedPkgs.indices) return
+        selectedPkgs = selectedPkgs.toMutableList().also { it.removeAt(index) }
+    }
+
+    fun clearPkgs() {
+        if (proxyRunning) return
+        selectedPkgs = emptyList()
         installOk = null
         installMsg = null
-    }
-
-    @Suppress("DEPRECATION")
-    private fun wifiNetwork(): Network? {
-        return try {
-            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            cm.allNetworks.firstOrNull {
-                cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    /** يطلب شبكة داتا الموبايل بالتوازي مع الواي فاي */
-    private suspend fun getCellular(): Network? = suspendCancellableCoroutine<Network?> { cont ->
-        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                if (cont.isActive) cont.resume(network)
-            }
-
-            override fun onUnavailable() {
-                if (cont.isActive) cont.resume(null)
-            }
-        }
-        cellCb = cb
-        val req = NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
-        try {
-            cm.requestNetwork(req, cb, 6000)
-        } catch (e: Exception) {
-            if (cont.isActive) cont.resume(null)
-        }
     }
 
     private fun acquireProxyLocks() {
         try {
             val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
-            val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ps4captures:proxy")
+            val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ps4captures:localpkg")
             wl.acquire(6 * 60 * 60 * 1000L)
             proxyWake = wl
             val wm = ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val wf = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "ps4captures:proxywifi")
+            val wf = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "ps4captures:localwifi")
             wf.acquire()
             proxyWifi = wf
         } catch (_: Exception) {
@@ -338,41 +328,30 @@ class AppState(private val ctx: Context) {
         proxyWifi = null
     }
 
-    private suspend fun startProxy(ps4Ip: String, url: String): String {
+    private suspend fun startLocalServer(ps4Ip: String, entries: List<LocalPkgEntry>): List<String> {
         stopProxy()
-        val wifi = wifiNetwork()
-        val slots = ArrayList<NetSlot>()
-        if (netMode == 0 || netMode == 2) slots.add(NetSlot(wifi, "Wi-Fi"))
-        if (netMode == 1 || netMode == 2) {
-            val cell = getCellular()
-            if (cell != null) {
-                slots.add(NetSlot(cell, "الداتا"))
-            } else if (netMode == 1) {
-                throw IOException("ما لكيت اتصال داتا الموبايل. فعّله وأعد المحاولة.")
-            }
+        val srv = LocalPkgServer(ctx, entries, ps4Ip)
+        withContext(Dispatchers.IO) { srv.prepare() }
+        val phoneIp = localIpFor(ps4Ip) ?: run {
+            srv.stop()
+            throw IOException("ما كدرت أعرف IP التلفون على الشبكة")
         }
-        if (slots.isEmpty()) slots.add(NetSlot(wifi, "Wi-Fi"))
-
-        val conns = CONN_OPTIONS[connIdx.coerceIn(0, CONN_OPTIONS.size - 1)]
-        val server = ProxyServer(conns, slots, ps4Ip)
-        val info = withContext(Dispatchers.IO) { server.prepare(url) }
-        val phoneIp = localIpFor(ps4Ip) ?: throw IOException("ما كدرت أعرف IP التلفون على الشبكة")
-        val port = server.start(8765)
-        proxy = server
+        val port = srv.start(8765)
+        server = srv
         proxyRunning = true
-        proxyView = ProxyView(info.name, 0, info.size, 0, server.liveLabels())
+        proxyView = ProxyView(srv.fileProgress(), 0, srv.totalSize(), 0, 0)
         acquireProxyLocks()
         try {
             ctx.startForegroundService(Intent(ctx, KeepAliveService::class.java))
         } catch (_: Exception) {
         }
         startPoll()
-        return "http://$phoneIp:$port/${info.name}"
+        return srv.urls(phoneIp, port)
     }
 
     fun stopProxy() {
-        proxy?.stop()
-        proxy = null
+        server?.stop()
+        server = null
         proxyRunning = false
         pollJob?.cancel()
         pollJob = null
@@ -381,28 +360,18 @@ class AppState(private val ctx: Context) {
             ctx.stopService(Intent(ctx, KeepAliveService::class.java))
         } catch (_: Exception) {
         }
-        val cb = cellCb
-        if (cb != null) {
-            try {
-                val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-                cm.unregisterNetworkCallback(cb)
-            } catch (_: Exception) {
-            }
-        }
-        cellCb = null
     }
 
     private fun startPoll() {
         pollJob?.cancel()
         pollJob = scope.launch {
-            val history = ArrayDeque<Triple<Long, Long, Long>>()
+            val history = ArrayDeque<Pair<Long, Long>>()
             while (proxyRunning) {
                 delay(500)
-                val srv = proxy ?: break
+                val srv = server ?: break
                 val served = srv.served.get()
-                val fetched = srv.fetchedTotal()
                 val now = SystemClock.elapsedRealtime()
-                history.addLast(Triple(now, served, fetched))
+                history.addLast(now to served)
                 while (history.size > 2 && now - history.first().first > 4000L) {
                     history.removeFirst()
                 }
@@ -413,26 +382,23 @@ class AppState(private val ctx: Context) {
                 } else {
                     0L
                 }
-                val fetchSpeed = if (history.size >= 2) {
-                    ((fetched - first.third) * 1000.0 / dt).toLong().coerceAtLeast(0L)
-                } else {
-                    0L
-                }
                 proxyView = ProxyView(
-                    srv.origin?.name ?: "", served, srv.total, speed, srv.liveLabels(),
-                    srv.requests.get(), srv.lastError,
-                    fetchSpeed, srv.readyBlocks(), srv.windowBlocks()
+                    srv.fileProgress(),
+                    served,
+                    srv.totalSize(),
+                    speed,
+                    srv.requests.get(),
+                    srv.lastError
                 )
             }
         }
     }
 
-    fun startInstall() {
+    fun startLocalInstall() {
         val s = session ?: return
-        val url = link.trim()
-        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+        if (selectedPkgs.isEmpty()) {
             installOk = false
-            installMsg = "الصق رابطًا يبدأ بـ http أو https"
+            installMsg = "اختر ملف .pkg واحد على الأقل من ذاكرة التلفون أولاً"
             return
         }
         if (installBusy) return
@@ -444,10 +410,10 @@ class AppState(private val ctx: Context) {
         scope.launch {
             try {
                 bindWifi()
-                val target = if (mode == 0) url else startProxy(s.ip, url)
+                val urls = startLocalServer(s.ip, selectedPkgs)
                 var timedOut = false
                 val r = try {
-                    withContext(Dispatchers.IO) { postInstall(s.ip, port, target) }
+                    withContext(Dispatchers.IO) { postInstall(s.ip, port, urls) }
                 } catch (e: java.net.ConnectException) {
                     null
                 } catch (e: java.net.SocketTimeoutException) {
@@ -455,23 +421,16 @@ class AppState(private val ctx: Context) {
                     null
                 }
                 if (r == null && timedOut) {
-                    // الـ PS4 ما رد لحد الآن (غالبًا يحضّر الملف). نخلي السيرفر شغّال ولا نقتله.
                     installOk = true
                     installWarn = true
-                    installMsg = if (mode == 1)
-                        "الـ PS4 ما رد على الأمر لحد الآن، وقد يكون مشغولًا بتحضير اللعبة. السيرفر باقي شغّال: راقب إشعارات الجهاز وعدّاد الطلبات بالأسفل."
-                    else
-                        "الـ PS4 ما رد على الأمر لحد الآن. راقب إشعارات الجهاز."
+                    installMsg = "الـ PS4 ما رد على الأمر لحد الآن، وقد يكون مشغولًا بتحضير الملفات. السيرفر المحلي باقي شغّال: راقب إشعارات الجهاز وعدّاد الطلبات بالأسفل."
                 } else if (r == null) {
                     stopProxy()
                     installOk = false
                     installMsg = "أداة التثبيت مو شغّالة على المنفذ $port. افتحها على الـ PS4 وأعد المحاولة."
                 } else if (r.code in 200..299) {
                     installOk = true
-                    installMsg = if (mode == 0)
-                        "تم إرسال الرابط. الـ PS4 ينزّل من الإنترنت مباشرة، تابع شاشته."
-                    else
-                        "تم إرسال الأمر. الـ PS4 هسه يسحب من تلفونك، لا تغلق التطبيق."
+                    installMsg = "تم إرسال ${urls.size} ملف للـ PS4. الجهاز يسحب الآن من ذاكرة تلفونك بأقصى سرعة، لا تغلق التطبيق."
                 } else {
                     stopProxy()
                     installOk = false
@@ -554,6 +513,7 @@ class AppState(private val ctx: Context) {
         savedUris.clear()
         viewer = null
         fullImage = null
+        selectedPkgs = emptyList()
         stopProxy()
         page = 0
     }
@@ -774,15 +734,8 @@ fun PS4App() {
     val ctx = LocalContext.current
     val state = remember { AppState(ctx.applicationContext) }
     val view = LocalView.current
-    val shared = pendingShared
-    LaunchedEffect(shared) {
-        if (shared != null) {
-            state.handleShared(shared)
-            pendingShared = null
-        }
-    }
 
-    // نبقي الشاشة شغّالة أثناء تحميل ملف كبير حتى لا ينقطع
+    // نبقي الشاشة شغّالة أثناء النقل أو تحميل ملف كبير حتى لا ينقطع
     val busy = state.proxyRunning || state.downloads.values.any { it >= 0f && it < 1f }
     DisposableEffect(busy) {
         view.keepScreenOn = busy
@@ -915,7 +868,7 @@ fun ConnectScreen(state: AppState) {
         Text("PS4 Captures", color = TextHi, fontSize = 32.sp, fontWeight = FontWeight.ExtraBold)
         Spacer(Modifier.height(6.dp))
         Text(
-            "استعرض لقطات ومقاطع جهازك مباشرةً من هاتفك،\nواحفظها بضغطة زر.",
+            "استعرض لقطات جهازك واحفظها بضغطة زر،\nأو انقل وثبّت ملفات PKG من هاتفك مباشرة.",
             color = TextLo,
             fontSize = 14.sp,
             lineHeight = 21.sp,
@@ -927,7 +880,7 @@ fun ConnectScreen(state: AppState) {
             Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 StepRow(1, "فعّل خادم FTP", "من إعدادات GoldHEN على جهاز PS4")
                 StepRow(2, "أدخل عنوان IP", "نجرّب كل المنافذ المعروفة تلقائيًا")
-                StepRow(3, "تصفّح واحفظ", "كأنك تتصفح معرض هاتفك، والتحميل من داخل كل صورة أو مقطع")
+                StepRow(3, "تصفّح أو انقل الألعاب", "احفظ صورك ومقاطعك أو ثبّت ملفات .pkg من جهازك")
             }
         }
 
@@ -1489,7 +1442,7 @@ fun SegPills(options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
 @Composable
 fun PageSwitch(state: AppState) {
     Box(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-        SegPills(listOf("المعرض", "تثبيت مباشر"), state.page) { state.page = it }
+        SegPills(listOf("المعرض", "نقل وتثبيت PKG"), state.page) { state.page = it }
     }
 }
 
@@ -1508,9 +1461,11 @@ private fun fieldColors() = OutlinedTextFieldDefaults.colors(
 
 @Composable
 fun InstallScreen(state: AppState) {
-    val clip = LocalClipboardManager.current
     val focus = LocalFocusManager.current
     val s = state.session
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) state.addPickedPkgs(uris)
+    }
 
     Column(
         Modifier
@@ -1529,7 +1484,7 @@ fun InstallScreen(state: AppState) {
                 Icon(Icons.AutoMirrored.Rounded.ArrowBack, null, tint = TextHi)
             }
             Column(Modifier.weight(1f)) {
-                Text("تثبيت مباشر", color = TextHi, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                Text("نقل وتثبيت PKG", color = TextHi, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.size(8.dp).clip(CircleShape).background(Good))
                     Spacer(Modifier.width(6.dp))
@@ -1545,76 +1500,148 @@ fun InstallScreen(state: AppState) {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             GlassCard {
-                Text("رابط اللعبة", color = TextHi, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-                Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = state.link,
-                    onValueChange = { state.link = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    minLines = 2,
-                    maxLines = 4,
-                    placeholder = { Text("https://…/game.pkg") },
-                    trailingIcon = {
-                        IconButton(onClick = {
-                            val t = clip.getText()?.text
-                            if (!t.isNullOrBlank()) state.link = t.trim()
-                        }) {
-                            Icon(Icons.Rounded.ContentPaste, null, tint = Accent)
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        "ملفات اللعبة من التلفون",
+                        color = TextHi,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 15.sp
+                    )
+                    if (state.selectedPkgs.isNotEmpty() && !state.proxyRunning) {
+                        Row(
+                            Modifier
+                                .clip(RoundedCornerShape(50))
+                                .clickable { state.clearPkgs() }
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Rounded.Delete, null, tint = Bad, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("مسح الكل", color = Bad, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
-                    },
-                    shape = RoundedCornerShape(16.dp),
-                    textStyle = TextStyle(color = TextHi, fontSize = 13.sp, textDirection = TextDirection.Ltr),
-                    colors = fieldColors()
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "رابط مباشر لملف .pkg. تكدر تشارك الرابط من المتصفح لهذا التطبيق وينلصق هنا تلقائيًا.",
-                    color = TextLo,
-                    fontSize = 12.sp,
-                    lineHeight = 18.sp
-                )
-            }
+                    }
+                }
 
-            GlassCard {
-                Text("طريقة النقل", color = TextHi, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-                Spacer(Modifier.height(10.dp))
-                SegPills(listOf("مباشر", "عبر التلفون (أسرع)"), state.mode) { state.updateMode(it) }
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    if (state.mode == 0)
-                        "الـ PS4 ينزّل الرابط من الإنترنت بنفسه. أبسط طريقة، والتلفون ما يشتغل."
-                    else
-                        "التلفون يسحب الملف بعدة اتصالات متوازية (وحتى من شبكتين) ويمرره للـ PS4. مفيد لما السيرفر يبطّئ الاتصال الواحد.",
+                    "اختر ملف .pkg أو عدة ملفات معًا (اللعبة + التحديث + الـ DLC) ليتم نقلها وتثبيتها مباشرة على الـ PS4 بدون فلاشة وبدون استهلاك إنترنت.",
                     color = TextLo,
                     fontSize = 12.sp,
                     lineHeight = 18.sp
                 )
-                if (state.mode == 1) {
-                    Spacer(Modifier.height(16.dp))
-                    Text("مصدر الإنترنت", color = TextHi, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                    Spacer(Modifier.height(8.dp))
-                    SegPills(listOf("Wi-Fi", "داتا الموبايل", "الاثنين معًا"), state.netMode) { state.updateNetMode(it) }
-                    if (state.netMode != 0) {
-                        Spacer(Modifier.height(8.dp))
+
+                Spacer(Modifier.height(12.dp))
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Accent.copy(alpha = 0.14f))
+                        .border(1.dp, Accent.copy(alpha = 0.45f), RoundedCornerShape(16.dp))
+                        .clickable(enabled = !state.proxyRunning && !state.installBusy) {
+                            picker.launch(arrayOf("*/*"))
+                        }
+                        .padding(vertical = 14.dp, horizontal = 16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            if (state.selectedPkgs.isEmpty()) Icons.Rounded.FolderOpen else Icons.Rounded.Add,
+                            null,
+                            tint = Accent,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
                         Text(
-                            "تنبيه: الداتا تُحسب من باقتك. وبعض الروابط المؤقتة مربوطة بالـ IP وتفشل على الداتا، والتطبيق يتجاوزها تلقائيًا.",
-                            color = Amber,
-                            fontSize = 12.sp,
-                            lineHeight = 18.sp
+                            if (state.selectedPkgs.isEmpty()) "اختيار ملفات .pkg من التلفون" else "إضافة ملفات .pkg أخرى",
+                            color = TextHi,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold
                         )
                     }
-                    Spacer(Modifier.height(16.dp))
-                    Text("عدد الاتصالات المتوازية", color = TextHi, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                    Spacer(Modifier.height(8.dp))
-                    SegPills(CONN_OPTIONS.map { "$it" }, state.connIdx) { state.updateConnIdx(it) }
                 }
+
+                if (state.selectedPkgs.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        state.selectedPkgs.forEachIndexed { idx, pkg ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Color.White.copy(alpha = 0.05f))
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        pkg.name,
+                                        color = TextHi,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        style = TextStyle(textDirection = TextDirection.Ltr)
+                                    )
+                                    if (pkg.size > 0) {
+                                        Text(
+                                            fmtSize(pkg.size),
+                                            color = TextLo,
+                                            fontSize = 11.sp
+                                        )
+                                    }
+                                }
+                                if (!state.proxyRunning) {
+                                    IconButton(
+                                        onClick = { state.removePkg(idx) },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(Icons.Rounded.Close, null, tint = TextLo, modifier = Modifier.size(18.dp))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    val totalBytes = state.selectedPkgs.sumOf { it.size }
+                    if (totalBytes > 0L) {
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            "المحدد: ${state.selectedPkgs.size} ملف · الإجمالي ${fmtSize(totalBytes)}",
+                            color = Good,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Amber.copy(alpha = 0.12f))
+                    .border(1.dp, Amber.copy(alpha = 0.35f), RoundedCornerShape(16.dp))
+                    .padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Rounded.Info, null, tint = Amber, modifier = Modifier.size(22.dp))
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    "لأعلى سرعة نقل (25–50 MB/s): وصّل الـ PS4 بكيبل LAN للراوتر، أو فعّل نقطة اتصال 5GHz من التلفون واشبك الـ PS4 عليها.",
+                    color = Amber,
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp
+                )
             }
 
             GlassCard {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text("منفذ أداة التثبيت", color = TextHi, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                        Text("الافتراضي 12800", color = TextLo, fontSize = 12.sp)
+                        Text("الافتراضي 12800 (Remote Package Installer)", color = TextLo, fontSize = 12.sp)
                     }
                     OutlinedTextField(
                         value = state.installPort,
@@ -1642,7 +1669,7 @@ fun InstallScreen(state: AppState) {
                     .background(Brush.horizontalGradient(listOf(Accent, Accent2)))
                     .clickable(enabled = !state.installBusy) {
                         focus.clearFocus()
-                        state.startInstall()
+                        state.startLocalInstall()
                     },
                 contentAlignment = Alignment.Center
             ) {
@@ -1654,9 +1681,9 @@ fun InstallScreen(state: AppState) {
                     )
                 } else {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Rounded.CloudDownload, null, tint = Color.White, modifier = Modifier.size(22.dp))
+                        Icon(Icons.Rounded.Upload, null, tint = Color.White, modifier = Modifier.size(22.dp))
                         Spacer(Modifier.width(10.dp))
-                        Text("إرسال للـ PS4", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                        Text("نقل وتثبيت على الـ PS4", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -1703,7 +1730,7 @@ private fun ProxyStatusCard(state: AppState) {
             Box(Modifier.size(8.dp).clip(CircleShape).background(Good))
             Spacer(Modifier.width(6.dp))
             Text(
-                "السيرفر الوسيط شغّال",
+                "سيرفر النقل المحلي شغّال",
                 color = Good,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 13.sp,
@@ -1719,17 +1746,6 @@ private fun ProxyStatusCard(state: AppState) {
                 Text("إيقاف", color = Bad, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             }
         }
-        Spacer(Modifier.height(10.dp))
-        Text(
-            v.name,
-            color = TextHi,
-            fontSize = 12.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.fillMaxWidth(),
-            textAlign = TextAlign.Start,
-            style = TextStyle(textDirection = TextDirection.Ltr)
-        )
         Spacer(Modifier.height(10.dp))
         LinearProgressIndicator(
             progress = { frac },
@@ -1758,7 +1774,7 @@ private fun ProxyStatusCard(state: AppState) {
             )
         }
         Text(
-            "${fmtSize(v.served)} / ${fmtSize(v.total)} · ${v.nets}",
+            "${fmtSize(v.served)} / ${fmtSize(v.total)} · شبكة محلية",
             color = TextLo,
             fontSize = 12.sp,
             style = TextStyle(textDirection = TextDirection.Content)
@@ -1768,14 +1784,24 @@ private fun ProxyStatusCard(state: AppState) {
             color = TextLo,
             fontSize = 12.sp
         )
-        Text(
-            "من الإنترنت: " + (if (v.fetchSpeed >= 1024) fmtSize(v.fetchSpeed) + "/s" else "—") +
-                " · جاهز بالذاكرة: ${v.ready}/${v.window}",
-            color = TextLo,
-            fontSize = 12.sp,
-            style = TextStyle(textDirection = TextDirection.Content)
-        )
+        if (v.files.size > 1) {
+            Spacer(Modifier.height(8.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                v.files.forEach { fp ->
+                    val pct = if (fp.size > 0) ((fp.sent.toDouble() / fp.size) * 100).toInt().coerceIn(0, 100) else 0
+                    Text(
+                        "${fp.name} · $pct%",
+                        color = TextLo,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = TextStyle(textDirection = TextDirection.Ltr)
+                    )
+                }
+            }
+        }
         if (v.error.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
             Text(
                 "آخر خطأ: ${v.error}",
                 color = Bad,
@@ -1786,7 +1812,7 @@ private fun ProxyStatusCard(state: AppState) {
         if (v.served < 5L * 1024 * 1024 && v.speed < 1024) {
             Spacer(Modifier.height(6.dp))
             Text(
-                "بانتظار الـ PS4 يبدأ السحب… شوف إشعارات الجهاز (التنزيلات). المرحلة الأولى قد تأخذ شوية.",
+                "بانتظار الـ PS4 يبدأ السحب… راقب إشعارات الجهاز (التنزيلات).",
                 color = Amber,
                 fontSize = 12.sp,
                 lineHeight = 18.sp
