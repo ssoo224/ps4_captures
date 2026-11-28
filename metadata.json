@@ -1,0 +1,5 @@
+{
+  "name": "PS4 Captures",
+  "description": "استعرض لقطات ومقاطع جهاز PS4 مباشرة عبر FTP، واحفظها بضغطة زر أو ثبّت ملفات PKG عن بُعد.",
+  "requestFramePermissions": []
+}
