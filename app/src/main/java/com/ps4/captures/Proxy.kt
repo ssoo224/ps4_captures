@@ -16,6 +16,8 @@ import java.net.URL
 import java.net.URLDecoder
 import java.util.Locale
 import java.util.concurrent.Callable
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -87,10 +89,8 @@ class ProxyServer(
     private val slots: List<NetSlot>,
     private val allowedIp: String
 ) {
-    private val chunk = 3 * 1024 * 1024
     private val fetchPool: ExecutorService = Executors.newFixedThreadPool(conns)
     private val handlerPool: ExecutorService = Executors.newCachedThreadPool()
-    private val permits = Semaphore(conns + 6)
 
     @Volatile private var stopped = false
     private var server: ServerSocket? = null
@@ -325,7 +325,7 @@ class ProxyServer(
             out.flush()
             return true
         }
-        if (o.ranges) streamRange(start, end, out) else streamSingle(out)
+        if (o.ranges) serveRange(start, end, out) else streamSingle(out)
         out.flush()
         return true
     }
@@ -387,44 +387,97 @@ class ProxyServer(
         }
     }
 
-    private fun streamRange(start: Long, end: Long, out: OutputStream) {
-        val queue = java.util.ArrayDeque<Triple<Long, Long, Future<ByteArray>>>()
-        var next = start
+    // ───── كاش الكتل + سحب مسبق (read-ahead) ─────
+    // الـ PS4 يطلب غالبًا أجزاء صغيرة بعدة اتصالات، فلو سحبنا كل طلب لحاله نستخدم اتصال واحد بس من السيرفر.
+    // هنا نسحب الكتل القادمة مسبقًا بكل الاتصالات المتوازية، ونقدّمها للـ PS4 من الذاكرة.
+    private val blockSize = 2 * 1024 * 1024
+    private val maxBlocks = 64
+    private val ahead = minOf(conns, 20)
 
-        fun schedule() {
-            while (next <= end && queue.size < conns + 2) {
-                if (queue.isNotEmpty()) {
-                    if (!permits.tryAcquire()) return
-                } else {
-                    permits.acquire()
-                }
-                val s = next
-                val e = minOf(s + chunk - 1, end)
-                queue.addLast(Triple(s, e, fetchPool.submit(Callable { fetchChunk(s, e) })))
-                next = e + 1
+    private class Block(val idx: Long) {
+        val fut = CompletableFuture<ByteArray>()
+
+        @Volatile
+        var touched: Long = System.nanoTime()
+    }
+
+    private val blocks = ConcurrentHashMap<Long, Block>()
+
+    private fun getBlock(idx: Long): Block {
+        var b = blocks[idx]
+        if (b == null) {
+            val nb = Block(idx)
+            val prev = blocks.putIfAbsent(idx, nb)
+            if (prev == null) {
+                startFetch(nb)
+                b = nb
+            } else {
+                b = prev
             }
         }
+        b.touched = System.nanoTime()
+        return b
+    }
 
+    private fun startFetch(b: Block) {
+        val size = origin?.size ?: 0L
+        val s = b.idx * blockSize
+        val e = minOf(s + blockSize - 1, size - 1)
         try {
-            schedule()
-            while (queue.isNotEmpty()) {
-                val t = queue.removeFirst()
-                val data = try {
-                    t.third.get()
-                } catch (ex: Exception) {
-                    permits.release()
-                    throw IOException(ex.cause?.message ?: ex.message ?: "فشل السحب")
+            fetchPool.execute {
+                try {
+                    b.fut.complete(fetchChunk(s, e))
+                } catch (t: Throwable) {
+                    blocks.remove(b.idx, b)
+                    b.fut.completeExceptionally(t)
                 }
-                permits.release()
-                out.write(data)
-                served.addAndGet(data.size.toLong())
-                schedule()
             }
-        } finally {
-            for (t in queue) {
-                t.third.cancel(true)
-                permits.release()
+        } catch (ex: Exception) {
+            blocks.remove(b.idx, b)
+            b.fut.completeExceptionally(ex)
+        }
+    }
+
+    private fun trim() {
+        if (blocks.size <= maxBlocks) return
+        synchronized(blocks) {
+            var excess = blocks.size - maxBlocks
+            val done = blocks.values.filter { it.fut.isDone }.sortedBy { it.touched }
+            for (d in done) {
+                if (excess <= 0) break
+                blocks.remove(d.idx, d)
+                excess--
             }
+        }
+    }
+
+    private fun serveRange(start: Long, end: Long, out: OutputStream) {
+        val size = origin?.size ?: throw IOException("لا يوجد ملف")
+        val lastBlock = (size - 1) / blockSize
+        var pos = start
+        while (pos <= end && !stopped) {
+            val idx = pos / blockSize
+            val blk = getBlock(idx)
+            var k = 1L
+            while (k <= ahead && idx + k <= lastBlock) {
+                getBlock(idx + k)
+                k++
+            }
+            val data = try {
+                blk.fut.get()
+            } catch (ex: Exception) {
+                throw IOException(ex.cause?.message ?: ex.message ?: "فشل السحب")
+            }
+            val blockStart = idx * blockSize
+            val from = (pos - blockStart).toInt()
+            val lastByte = minOf(end, blockStart + data.size - 1)
+            val to = (lastByte - blockStart).toInt()
+            out.write(data, from, to - from + 1)
+            served.addAndGet((to - from + 1).toLong())
+            pos = lastByte + 1
+            // استُهلكت الكتلة كاملة: نحررها من الذاكرة
+            if (lastByte == blockStart + data.size - 1) blocks.remove(idx, blk)
+            trim()
         }
     }
 
