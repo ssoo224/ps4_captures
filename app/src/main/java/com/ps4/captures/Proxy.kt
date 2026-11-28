@@ -3,7 +3,6 @@ package com.ps4.captures
 import android.net.Network
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -15,13 +14,11 @@ import java.net.Socket
 import java.net.URL
 import java.net.URLDecoder
 import java.util.Locale
-import java.util.concurrent.Callable
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.Future
-import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 // ───────────── طلب التثبيت لأداة الـ PS4 ─────────────
@@ -77,12 +74,19 @@ class NetSlot(val net: Network?, val label: String) {
     @Volatile var inflight: Int = 0
     @Volatile var fails: Int = 0
     @Volatile var dead: Boolean = false
+    @Volatile var lastRefreshAt: Long = 0L
     val bytes = AtomicLong(0)
 }
 
+private class HttpFailException(
+    val code: Int,
+    val retryAfterMs: Long,
+    message: String
+) : IOException(message)
+
 /**
  * سيرفر HTTP صغير على التلفون: الـ PS4 يطلب منه الملف، والتلفون يسحبه من الإنترنت
- * بعدة اتصالات متوازية (ومن أكثر من شبكة) ويمرره للـ PS4 بالترتيب بدون حفظه على التلفون.
+ * بعدة اتصالات متوازية ثابتة (ومن أكثر من شبكة) مع تحكّم تكيّفي بالسرعة وتجديد تلقائي للروابط.
  */
 class ProxyServer(
     private val conns: Int,
@@ -93,21 +97,30 @@ class ProxyServer(
     private val handlerPool: ExecutorService = Executors.newCachedThreadPool()
 
     @Volatile private var stopped = false
+    @Volatile private var originalUrl: String = ""
     private var server: ServerSocket? = null
 
     val served = AtomicLong(0)
     val requests = AtomicLong(0)
 
     @Volatile var lastError: String = ""
-
     @Volatile var origin: OriginInfo? = null
+
+    private val effectiveMax = AtomicInteger(conns)
+    private val activeFetchers = AtomicInteger(0)
+    private val okStreak = AtomicInteger(0)
+    private val throttleLock = Object()
 
     val total: Long get() = origin?.size ?: 0L
 
-    fun liveLabels(): String = slots.filter { !it.dead }.joinToString(" + ") { it.label }
+    fun liveLabels(): String {
+        val nets = slots.filter { !it.dead }.joinToString(" + ") { it.label }
+        return "$nets (${effectiveMax.get()})"
+    }
 
     // ───── فحص الرابط ─────
     fun prepare(url: String): OriginInfo {
+        originalUrl = url
         var info: OriginInfo? = null
         var lastErr: Exception? = null
         for (slot in slots) {
@@ -124,12 +137,13 @@ class ProxyServer(
         return info
     }
 
-    private fun open(url: String, net: Network?): HttpURLConnection {
+    private fun open(url: String, net: Network?, method: String = "GET"): HttpURLConnection {
         val u = URL(url)
         val c = (if (net != null) net.openConnection(u) else u.openConnection()) as HttpURLConnection
         c.instanceFollowRedirects = false
+        c.requestMethod = method
         c.connectTimeout = 10000
-        c.readTimeout = 30000
+        c.readTimeout = 15000
         c.setRequestProperty(
             "User-Agent",
             "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
@@ -139,14 +153,22 @@ class ProxyServer(
     }
 
     /** طلب مع تتبع التحويلات يدويًا (يشمل http ← https) */
-    private fun requestFollowing(url: String, net: Network?, range: String?): Pair<HttpURLConnection, String> {
+    private fun requestFollowing(
+        url: String,
+        net: Network?,
+        range: String?,
+        method: String = "GET"
+    ): Pair<HttpURLConnection, String> {
         var cur = url
-        for (hop in 0 until 6) {
-            val c = open(cur, net)
+        for (hop in 0 until 8) {
+            val c = open(cur, net, method)
             if (range != null) c.setRequestProperty("Range", range)
             val code = c.responseCode
             if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
-                val loc = c.getHeaderField("Location") ?: throw IOException("تحويل بدون عنوان")
+                val loc = c.getHeaderField("Location") ?: run {
+                    c.disconnect()
+                    throw IOException("تحويل بدون عنوان")
+                }
                 c.disconnect()
                 cur = URL(URL(cur), loc).toString()
             } else {
@@ -157,22 +179,38 @@ class ProxyServer(
     }
 
     private fun probe(url: String, slot: NetSlot): OriginInfo {
-        val (c, finalUrl) = requestFollowing(url, slot.net, "bytes=0-0")
+        var (c, finalUrl) = requestFollowing(url, slot.net, "bytes=0-0")
         try {
-            val code = c.responseCode
+            var code = c.responseCode
+            val ctype = (c.contentType ?: "").lowercase(Locale.US)
+            if ("text/html" in ctype) {
+                throw IOException("الرابط يرجع صفحة ويب (HTML) وليس ملف .pkg مباشر")
+            }
+
+            if (code == 400 || code == 405 || code == 416) {
+                c.disconnect()
+                val headRes = requestFollowing(url, slot.net, null, method = "HEAD")
+                c = headRes.first
+                finalUrl = headRes.second
+                code = c.responseCode
+            }
+
             var size = -1L
             var ranges = false
             if (code == 206) {
                 val cr = c.getHeaderField("Content-Range") ?: ""
                 size = cr.substringAfterLast('/').trim().toLongOrNull() ?: -1L
                 ranges = size > 0
-            } else if (code == 200) {
+            } else if (code in 200..299) {
                 size = c.getHeaderField("Content-Length")?.toLongOrNull() ?: -1L
+                ranges = c.getHeaderField("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
             } else {
                 throw IOException("رد السيرفر: HTTP $code (${slot.label})")
             }
+
             if (size <= 0) throw IOException("حجم الملف غير معروف")
             slot.url = finalUrl
+            slot.lastRefreshAt = System.currentTimeMillis()
             val disp = c.getHeaderField("Content-Disposition") ?: ""
             val fn = Regex("""filename\*?=(?:UTF-8'')?"?([^";]+)"?""", RegexOption.IGNORE_CASE)
                 .find(disp)?.groupValues?.get(1)
@@ -183,10 +221,29 @@ class ProxyServer(
         }
     }
 
+    private fun refreshSlotUrl(slot: NetSlot) {
+        val base = originalUrl
+        if (base.isEmpty()) return
+        synchronized(slot) {
+            val now = System.currentTimeMillis()
+            if (now - slot.lastRefreshAt < 5000L) return
+            val (c, finalUrl) = requestFollowing(base, slot.net, "bytes=0-0")
+            try {
+                val code = c.responseCode
+                if (code == 206 || code in 200..299) {
+                    slot.url = finalUrl
+                    slot.lastRefreshAt = System.currentTimeMillis()
+                }
+            } finally {
+                c.disconnect()
+            }
+        }
+    }
+
     private fun safeName(raw: String): String {
         val dec = try {
             URLDecoder.decode(raw, "UTF-8")
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             raw
         }
         var n = dec.replace(Regex("[^A-Za-z0-9._-]+"), "_").trim('_').take(80)
@@ -199,7 +256,7 @@ class ProxyServer(
     fun start(preferredPort: Int): Int {
         val ss = try {
             ServerSocket(preferredPort, 64)
-        } catch (e: IOException) {
+        } catch (_: IOException) {
             ServerSocket(0, 64)
         }
         server = ss
@@ -209,22 +266,23 @@ class ProxyServer(
 
     fun stop() {
         stopped = true
+        synchronized(throttleLock) { throttleLock.notifyAll() }
         try {
             server?.close()
         } catch (_: Exception) {
         }
         fetchPool.shutdownNow()
         handlerPool.shutdownNow()
+        blocks.clear()
     }
 
     private fun acceptLoop(ss: ServerSocket) {
         while (!stopped) {
             val s = try {
                 ss.accept()
-            } catch (e: IOException) {
+            } catch (_: IOException) {
                 break
             }
-            // نقبل الاتصال من الـ PS4 فقط
             if (s.inetAddress?.hostAddress != allowedIp) {
                 try {
                     s.close()
@@ -252,7 +310,7 @@ class ProxyServer(
             sock.tcpNoDelay = true
             sock.sendBufferSize = 1 shl 20
             sock.soTimeout = 120000
-            val ins = BufferedInputStream(sock.getInputStream(), 16 * 1024)
+            val ins = sock.getInputStream().buffered(16 * 1024)
             val out = sock.getOutputStream()
             while (!stopped) {
                 val reqLine = readLine(ins) ?: break
@@ -335,7 +393,39 @@ class ProxyServer(
         return true
     }
 
-    // ───── السحب المتوازي ─────
+    // ───── السحب المتوازي مع تحكّم تكيّفي ─────
+    private fun acquireThrottlePermit() {
+        synchronized(throttleLock) {
+            while (!stopped && activeFetchers.get() >= effectiveMax.get()) {
+                throttleLock.wait(200)
+            }
+            if (stopped) throw IOException("تم إيقاف السيرفر")
+            activeFetchers.incrementAndGet()
+        }
+    }
+
+    private fun releaseThrottlePermit() {
+        activeFetchers.decrementAndGet()
+        synchronized(throttleLock) { throttleLock.notifyAll() }
+    }
+
+    private fun onSuccess() {
+        val streak = okStreak.incrementAndGet()
+        val cur = effectiveMax.get()
+        if (cur < conns && streak >= 16) {
+            effectiveMax.compareAndSet(cur, minOf(conns, cur + 2))
+            okStreak.set(0)
+        }
+    }
+
+    private fun onThrottle() {
+        okStreak.set(0)
+        val cur = effectiveMax.get()
+        if (cur > 4) {
+            effectiveMax.compareAndSet(cur, maxOf(4, (cur * 0.7).toInt()))
+        }
+    }
+
     private fun pickSlot(exclude: NetSlot?): NetSlot? {
         synchronized(slots) {
             val alive = slots.filter { !it.dead }
@@ -354,26 +444,50 @@ class ProxyServer(
         val want = (e - s + 1).toInt()
         var attempt = 0
         var last: NetSlot? = null
+        var refreshedOnce = false
         while (true) {
-            val slot = pickSlot(last) ?: throw IOException("لا توجد شبكة متاحة")
+            if (stopped) throw IOException("تم إيقاف السيرفر")
+            acquireThrottlePermit()
+            val slot = try {
+                pickSlot(last) ?: throw IOException("لا توجد شبكة متاحة")
+            } catch (ex: Throwable) {
+                releaseThrottlePermit()
+                throw ex
+            }
             var conn: HttpURLConnection? = null
             try {
                 val (c, _) = requestFollowing(slot.url, slot.net, "bytes=$s-$e")
                 conn = c
                 val code = c.responseCode
-                if (code != 206) throw IOException("HTTP $code")
+                if (code == 429 || code == 503) {
+                    val ra = c.getHeaderField("Retry-After")?.trim()?.toLongOrNull()
+                    val waitMs = if (ra != null && ra > 0) minOf(ra * 1000L, 8000L) else 1200L
+                    throw HttpFailException(code, waitMs, "HTTP $code")
+                }
+                if ((code == 401 || code == 403 || code == 410) && !refreshedOnce) {
+                    refreshedOnce = true
+                    c.disconnect()
+                    conn = null
+                    refreshSlotUrl(slot)
+                    continue
+                }
+                if (code != 206) throw HttpFailException(code, 0L, "HTTP $code")
+
                 val buf = ByteArray(want)
                 var off = 0
                 c.inputStream.use { ins ->
-                    while (off < want) {
+                    while (off < want && !stopped) {
                         val n = ins.read(buf, off, want - off)
                         if (n < 0) break
                         off += n
                     }
                 }
+                if (stopped) throw IOException("تم إيقاف السيرفر")
                 if (off < want) throw IOException("انقطاع أثناء السحب")
                 slot.bytes.addAndGet(want.toLong())
                 slot.fails = 0
+                onSuccess()
+                lastError = ""
                 return buf
             } catch (ex: IOException) {
                 try {
@@ -382,22 +496,31 @@ class ProxyServer(
                 }
                 slot.fails = slot.fails + 1
                 if (slot.fails >= 4 && slots.count { !it.dead } > 1) slot.dead = true
+                if (ex is HttpFailException && (ex.code == 429 || ex.code == 503)) {
+                    onThrottle()
+                } else if (attempt >= 1) {
+                    onThrottle()
+                }
                 attempt++
                 last = slot
                 if (attempt >= 8 || stopped) throw ex
-                Thread.sleep(300L * minOf(attempt, 5))
+                val sleepMs = if (ex is HttpFailException && ex.retryAfterMs > 0) {
+                    ex.retryAfterMs
+                } else {
+                    250L * minOf(attempt, 6)
+                }
+                Thread.sleep(sleepMs)
             } finally {
-                synchronized(slots) { slot.inflight = slot.inflight - 1 }
+                synchronized(slots) { slot.inflight = maxOf(0, slot.inflight - 1) }
+                releaseThrottlePermit()
             }
         }
     }
 
-    // ───── كاش الكتل + سحب مسبق (read-ahead) ─────
-    // الـ PS4 يطلب غالبًا أجزاء صغيرة بعدة اتصالات، فلو سحبنا كل طلب لحاله نستخدم اتصال واحد بس من السيرفر.
-    // هنا نسحب الكتل القادمة مسبقًا بكل الاتصالات المتوازية، ونقدّمها للـ PS4 من الذاكرة.
+    // ───── كاش الكتل + سحب مسبق ذكي (read-ahead) ─────
     private val blockSize = 2 * 1024 * 1024
-    private val maxBlocks = 64
-    private val ahead = minOf(conns, 20)
+    private val maxBlocks = 48
+    private val ahead = minOf(conns, 16)
 
     private class Block(val idx: Long) {
         val fut = CompletableFuture<ByteArray>()
@@ -433,7 +556,7 @@ class ProxyServer(
                 try {
                     b.fut.complete(fetchChunk(s, e))
                 } catch (t: Throwable) {
-                    lastError = t.message ?: t.javaClass.simpleName
+                    if (!stopped) lastError = t.message ?: t.javaClass.simpleName
                     blocks.remove(b.idx, b)
                     b.fut.completeExceptionally(t)
                 }
@@ -464,10 +587,13 @@ class ProxyServer(
         while (pos <= end && !stopped) {
             val idx = pos / blockSize
             val blk = getBlock(idx)
-            var k = 1L
-            while (k <= ahead && idx + k <= lastBlock) {
-                getBlock(idx + k)
-                k++
+            if (end - pos + 1 > 256L * 1024) {
+                val lookAhead = minOf(ahead, effectiveMax.get())
+                var k = 1L
+                while (k <= lookAhead && idx + k <= lastBlock) {
+                    getBlock(idx + k)
+                    k++
+                }
             }
             val data = try {
                 blk.fut.get()
@@ -481,7 +607,6 @@ class ProxyServer(
             out.write(data, from, to - from + 1)
             served.addAndGet((to - from + 1).toLong())
             pos = lastByte + 1
-            // استُهلكت الكتلة كاملة: نحررها من الذاكرة
             if (lastByte == blockStart + data.size - 1) blocks.remove(idx, blk)
             trim()
         }
@@ -491,14 +616,18 @@ class ProxyServer(
     private fun streamSingle(out: OutputStream) {
         val slot = slots.firstOrNull { !it.dead } ?: throw IOException("لا توجد شبكة متاحة")
         val (c, _) = requestFollowing(slot.url, slot.net, null)
-        c.inputStream.use { ins ->
-            val buf = ByteArray(256 * 1024)
-            while (true) {
-                val n = ins.read(buf)
-                if (n < 0) break
-                out.write(buf, 0, n)
-                served.addAndGet(n.toLong())
+        try {
+            c.inputStream.use { ins ->
+                val buf = ByteArray(256 * 1024)
+                while (!stopped) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    served.addAndGet(n.toLong())
+                }
             }
+        } finally {
+            c.disconnect()
         }
     }
 }
