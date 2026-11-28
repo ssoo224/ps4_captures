@@ -149,7 +149,7 @@ private class StreamBlock(val idx: Long, val expectedSize: Int) {
 
 /**
  * سيرفر HTTP صغير على التلفون: الـ PS4 يطلب منه الملف، والتلفون يسحبه من الإنترنت
- * بكل الاتصالات المحددة بالتوازي مع بث فوري للـ PS4 وإنقاذ تلقائي للكتل المتأخرة.
+ * بكل الاتصالات المحددة بالتوازي مع كشف فوري للاتصالات البطيئة واستبدالها لتثبيت أقصى سرعة.
  */
 class ProxyServer(
     private val conns: Int,
@@ -213,8 +213,8 @@ class ProxyServer(
         val c = (if (net != null) net.openConnection(u) else u.openConnection()) as HttpURLConnection
         c.instanceFollowRedirects = false
         c.requestMethod = method
-        c.connectTimeout = 6000
-        c.readTimeout = 7000
+        c.connectTimeout = 5000
+        c.readTimeout = 5000
         c.setRequestProperty(
             "User-Agent",
             "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
@@ -563,7 +563,8 @@ class ProxyServer(
                             val writtenNow = blk.append(tmp, curOffset, n)
                             curOffset += n
                             slot.bytes.addAndGet(n.toLong())
-                            if (writtenNow > curOffset + 256 * 1024) {
+                            if (writtenNow > curOffset + 128 * 1024) {
+                                // المسار البديل أسرع بوضوح، نغلق هذا الاتصال البطيء فورًا
                                 return
                             }
                         }
@@ -611,9 +612,9 @@ class ProxyServer(
         }
     }
 
-    // ───── كاش الكتل (2 MB) + تفعيل كل الاتصالات بالتوازي ─────
-    private val blockSize = 2 * 1024 * 1024
-    private val maxBlocks = maxOf(24, conns * 2)
+    // ───── كاش الكتل (1 MB) + كشف فوري للكتل المتأخرة ─────
+    private val blockSize = 1 * 1024 * 1024
+    private val maxBlocks = maxOf(32, conns * 3)
     private val ahead = minOf(conns, 12)
 
     private val blocks = ConcurrentHashMap<Long, StreamBlock>()
@@ -671,6 +672,20 @@ class ProxyServer(
         }
     }
 
+    private fun maybeHedge(blk: StreamBlock, idx: Long, avail: Int, slowProgress: Boolean) {
+        if (blk.done || stopped || (blk.expectedSize - avail) <= 128 * 1024) return
+        val nextDone = blocks[idx + 1]?.done == true
+        if (!nextDone && !slowProgress) return
+        val nowMs = System.currentTimeMillis()
+        val prevHedge = blk.lastHedgeAtMs.get()
+        if (nowMs - prevHedge >= 1800L &&
+            blk.activeAttempts.get() < 2 &&
+            blk.lastHedgeAtMs.compareAndSet(prevHedge, nowMs)
+        ) {
+            startFetch(blk, isHedge = true, startOffsetInBlock = avail)
+        }
+    }
+
     private fun serveRange(start: Long, end: Long, out: OutputStream) {
         val size = origin?.size ?: throw IOException("لا يوجد ملف")
         val lastBlock = (size - 1) / blockSize
@@ -691,25 +706,36 @@ class ProxyServer(
             val needEndInBlock = (blockEndByte - blockStart + 1).toInt()
             var posInBlock = (pos - blockStart).toInt()
             var dirty = false
+            var lastCheckMs = System.currentTimeMillis()
+            var lastCheckWritten = blk.written
 
             while (posInBlock < needEndInBlock && !stopped) {
                 var avail = blk.written
+                val nowMs = System.currentTimeMillis()
+                val elapsed = nowMs - lastCheckMs
+                val slowProgress = elapsed >= 1500L && (avail - lastCheckWritten) < 350 * 1024
+                maybeHedge(blk, idx, avail, slowProgress)
+                if (elapsed >= 1500L) {
+                    lastCheckMs = nowMs
+                    lastCheckWritten = avail
+                }
+
                 if (avail <= posInBlock) {
                     if (dirty) {
                         out.flush()
                         dirty = false
                     }
-                    avail = blk.awaitAvailable(posInBlock, 1500L)
+                    avail = blk.awaitAvailable(posInBlock, 1200L)
                     if (avail <= posInBlock && !blk.done && !stopped) {
-                        val nowMs = System.currentTimeMillis()
+                        val ms2 = System.currentTimeMillis()
                         val prevHedge = blk.lastHedgeAtMs.get()
-                        if (nowMs - prevHedge >= 2000L &&
+                        if (ms2 - prevHedge >= 1800L &&
                             blk.activeAttempts.get() < 2 &&
-                            blk.lastHedgeAtMs.compareAndSet(prevHedge, nowMs)
+                            blk.lastHedgeAtMs.compareAndSet(prevHedge, ms2)
                         ) {
-                            startFetch(blk, isHedge = true, startOffsetInBlock = blk.written)
+                            startFetch(blk, isHedge = true, startOffsetInBlock = avail)
                         }
-                        avail = blk.awaitAvailable(posInBlock, 3500L)
+                        avail = blk.awaitAvailable(posInBlock, 3000L)
                     }
                 }
                 if (avail > posInBlock) {
