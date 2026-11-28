@@ -3,6 +3,7 @@ package com.ps4.captures
 import android.net.Network
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -100,7 +101,7 @@ private class FetchTask(
     }
 }
 
-/** كتلة بث تدريجي: تمرّر البايتات للـ PS4 فور وصولها كل 32KB بدون انتظار اكتمال الكتلة */
+/** كتلة بث تدريجي: تمرّر البايتات للـ PS4 فور وصولها بدون انتظار اكتمال الكتلة */
 private class StreamBlock(val idx: Long, val expectedSize: Int) {
     val data = ByteArray(expectedSize)
     private val lock = ReentrantLock()
@@ -148,7 +149,7 @@ private class StreamBlock(val idx: Long, val expectedSize: Int) {
 
 /**
  * سيرفر HTTP صغير على التلفون: الـ PS4 يطلب منه الملف، والتلفون يسحبه من الإنترنت
- * بكتل متوازية مركّزة (4MB) وبث فوري كل 32KB مع إنقاذ تلقائي وتجديد للروابط المنتهية.
+ * بكل الاتصالات المحددة بالتوازي مع بث فوري للـ PS4 وإنقاذ تلقائي للكتل المتأخرة.
  */
 class ProxyServer(
     private val conns: Int,
@@ -377,10 +378,10 @@ class ProxyServer(
     private fun handle(sock: Socket) {
         try {
             sock.tcpNoDelay = true
-            sock.sendBufferSize = 512 * 1024
+            sock.sendBufferSize = 1 shl 20
             sock.soTimeout = 120000
             val ins = sock.getInputStream().buffered(16 * 1024)
-            val out = sock.getOutputStream()
+            val out = BufferedOutputStream(sock.getOutputStream(), 128 * 1024)
             while (!stopped) {
                 val reqLine = readLine(ins) ?: break
                 if (reqLine.isEmpty()) continue
@@ -522,7 +523,7 @@ class ProxyServer(
         var attempt = 0
         var last: NetSlot? = null
         var refreshedOnce = false
-        val tmp = ByteArray(32 * 1024)
+        val tmp = ByteArray(64 * 1024)
 
         while (curOffset < blk.expectedSize && !blk.done && !stopped) {
             acquirePermit(bypassLimit = isHedge)
@@ -610,10 +611,10 @@ class ProxyServer(
         }
     }
 
-    // ───── كاش الكتل (4 MB) ببث فوري + سحب مسبق مركز (حتى 3 كتل) ─────
-    private val blockSize = 4 * 1024 * 1024
-    private val maxBlocks = 16
-    private val ahead = minOf(conns, 3)
+    // ───── كاش الكتل (2 MB) + تفعيل كل الاتصالات بالتوازي ─────
+    private val blockSize = 2 * 1024 * 1024
+    private val maxBlocks = maxOf(24, conns * 2)
+    private val ahead = minOf(conns, 12)
 
     private val blocks = ConcurrentHashMap<Long, StreamBlock>()
 
@@ -689,24 +690,33 @@ class ProxyServer(
             val blockEndByte = minOf(end, blockStart + blk.expectedSize - 1)
             val needEndInBlock = (blockEndByte - blockStart + 1).toInt()
             var posInBlock = (pos - blockStart).toInt()
+            var dirty = false
 
             while (posInBlock < needEndInBlock && !stopped) {
-                var avail = blk.awaitAvailable(posInBlock, 2000L)
-                if (avail <= posInBlock && !blk.done && !stopped) {
-                    val nowMs = System.currentTimeMillis()
-                    val prevHedge = blk.lastHedgeAtMs.get()
-                    if (nowMs - prevHedge >= 2500L &&
-                        blk.activeAttempts.get() < 2 &&
-                        blk.lastHedgeAtMs.compareAndSet(prevHedge, nowMs)
-                    ) {
-                        startFetch(blk, isHedge = true, startOffsetInBlock = blk.written)
+                var avail = blk.written
+                if (avail <= posInBlock) {
+                    if (dirty) {
+                        out.flush()
+                        dirty = false
                     }
-                    avail = blk.awaitAvailable(posInBlock, 4000L)
+                    avail = blk.awaitAvailable(posInBlock, 1500L)
+                    if (avail <= posInBlock && !blk.done && !stopped) {
+                        val nowMs = System.currentTimeMillis()
+                        val prevHedge = blk.lastHedgeAtMs.get()
+                        if (nowMs - prevHedge >= 2000L &&
+                            blk.activeAttempts.get() < 2 &&
+                            blk.lastHedgeAtMs.compareAndSet(prevHedge, nowMs)
+                        ) {
+                            startFetch(blk, isHedge = true, startOffsetInBlock = blk.written)
+                        }
+                        avail = blk.awaitAvailable(posInBlock, 3500L)
+                    }
                 }
                 if (avail > posInBlock) {
                     val writeTo = minOf(avail, needEndInBlock)
                     val count = writeTo - posInBlock
                     out.write(blk.data, posInBlock, count)
+                    dirty = true
                     served.addAndGet(count.toLong())
                     posInBlock = writeTo
                     pos += count
@@ -714,6 +724,7 @@ class ProxyServer(
                     break
                 }
             }
+            if (dirty) out.flush()
             if (posInBlock >= blk.expectedSize) blocks.remove(idx, blk)
             trim()
         }
@@ -733,6 +744,7 @@ class ProxyServer(
                     served.addAndGet(n.toLong())
                 }
             }
+            out.flush()
         } finally {
             c.disconnect()
         }

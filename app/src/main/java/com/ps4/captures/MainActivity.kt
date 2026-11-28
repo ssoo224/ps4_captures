@@ -154,7 +154,7 @@ private val TextLo = Color(0xFF93A0C8)
 /** رابط مشارك من تطبيق آخر (مشاركة ← PS4 Captures) */
 var pendingShared by mutableStateOf<String?>(null)
 
-val CONN_OPTIONS = listOf(4, 6, 8, 16)
+val CONN_OPTIONS = listOf(4, 8, 12, 16)
 
 data class ProxyView(
     val name: String = "",
