@@ -14,17 +14,17 @@ import java.net.Socket
 import java.net.URL
 import java.net.URLDecoder
 import java.util.Locale
-import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.PriorityBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 // ───────────── طلب التثبيت لأداة الـ PS4 ─────────────
 data class InstallResult(val code: Int, val body: String)
@@ -101,9 +101,55 @@ private class FetchTask(
     }
 }
 
+/** كتلة بث تدريجي: تمرّر البايتات للـ PS4 فور وصولها كل 32KB بدون انتظار اكتمال الكتلة */
+private class StreamBlock(val idx: Long, val expectedSize: Int) {
+    val data = ByteArray(expectedSize)
+    private val lock = ReentrantLock()
+    private val cond = lock.newCondition()
+
+    @Volatile var written = 0
+    @Volatile var done = false
+    @Volatile var error: Throwable? = null
+    @Volatile var touched = System.nanoTime()
+    val hedged = AtomicBoolean(false)
+    val activeAttempts = AtomicInteger(0)
+
+    fun append(buf: ByteArray, offsetInBlock: Int, len: Int): Int = lock.withLock {
+        if (done || error != null) return@withLock written
+        val endPos = offsetInBlock + len
+        if (endPos > written) {
+            val startCopy = maxOf(written, offsetInBlock)
+            val copyLen = endPos - startCopy
+            System.arraycopy(buf, startCopy - offsetInBlock, data, startCopy, copyLen)
+            written = endPos
+            if (written >= expectedSize) done = true
+            cond.signalAll()
+        }
+        written
+    }
+
+    fun failIfLast(t: Throwable) = lock.withLock {
+        if (activeAttempts.decrementAndGet() <= 0 && !done) {
+            error = t
+            cond.signalAll()
+        }
+    }
+
+    fun awaitAvailable(pos: Int, timeoutMs: Long): Int = lock.withLock {
+        if (written > pos) return@withLock written
+        val err = error
+        if (err != null) throw IOException(err.message ?: "فشل السحب", err)
+        if (done) return@withLock written
+        cond.await(timeoutMs, TimeUnit.MILLISECONDS)
+        val err2 = error
+        if (err2 != null) throw IOException(err2.message ?: "فشل السحب", err2)
+        written
+    }
+}
+
 /**
  * سيرفر HTTP صغير على التلفون: الـ PS4 يطلب منه الملف، والتلفون يسحبه من الإنترنت
- * بعدة اتصالات متوازية بأولوية الكتل الأقرب وإنقاذ تلقائي للكتل المتأخرة لتثبيت السرعة.
+ * بعدة اتصالات متوازية ويبثه للـ PS4 تدريجيًا فورًا بأعلى ثبات.
  */
 class ProxyServer(
     private val conns: Int,
@@ -133,7 +179,8 @@ class ProxyServer(
     private val effectiveMax = AtomicInteger(conns)
     private val activeFetchers = AtomicInteger(0)
     private val okStreak = AtomicInteger(0)
-    private val throttleLock = Object()
+    private val throttleLock = ReentrantLock()
+    private val throttleCond = throttleLock.newCondition()
 
     val total: Long get() = origin?.size ?: 0L
 
@@ -176,7 +223,6 @@ class ProxyServer(
         return c
     }
 
-    /** طلب مع تتبع التحويلات يدويًا (يشمل http ← https) */
     private fun requestFollowing(
         url: String,
         net: Network?,
@@ -290,7 +336,7 @@ class ProxyServer(
 
     fun stop() {
         stopped = true
-        synchronized(throttleLock) { throttleLock.notifyAll() }
+        throttleLock.withLock { throttleCond.signalAll() }
         try {
             server?.close()
         } catch (_: Exception) {
@@ -424,9 +470,9 @@ class ProxyServer(
             activeFetchers.incrementAndGet()
             return
         }
-        synchronized(throttleLock) {
+        throttleLock.withLock {
             while (!stopped && activeFetchers.get() >= effectiveMax.get()) {
-                throttleLock.wait(150)
+                throttleCond.await(150, TimeUnit.MILLISECONDS)
             }
             if (stopped) throw IOException("تم إيقاف السيرفر")
             activeFetchers.incrementAndGet()
@@ -435,13 +481,13 @@ class ProxyServer(
 
     private fun releasePermit() {
         activeFetchers.decrementAndGet()
-        synchronized(throttleLock) { throttleLock.notifyAll() }
+        throttleLock.withLock { throttleCond.signalAll() }
     }
 
     private fun onSuccess() {
         val streak = okStreak.incrementAndGet()
         val cur = effectiveMax.get()
-        if (cur < conns && streak >= 20) {
+        if (cur < conns && streak >= 12) {
             effectiveMax.compareAndSet(cur, minOf(conns, cur + 2))
             okStreak.set(0)
         }
@@ -469,19 +515,17 @@ class ProxyServer(
         }
     }
 
-    private fun fetchChunk(
-        s: Long,
-        e: Long,
-        isHedge: Boolean,
-        stopEarly: () -> Boolean
-    ): ByteArray? {
-        val want = (e - s + 1).toInt()
+    private fun fetchIntoBlock(blk: StreamBlock, startOffsetInBlock: Int, isHedge: Boolean) {
+        val totalSize = origin?.size ?: throw IOException("لا يوجد ملف")
+        val blockStart = blk.idx * blockSize
+        val e = minOf(blockStart + blk.expectedSize - 1, totalSize - 1)
+        var curOffset = startOffsetInBlock
         var attempt = 0
         var last: NetSlot? = null
         var refreshedOnce = false
-        while (true) {
-            if (stopped) throw IOException("تم إيقاف السيرفر")
-            if (stopEarly()) return null
+        val tmp = ByteArray(32 * 1024)
+
+        while (curOffset < blk.expectedSize && !blk.done && !stopped) {
             acquirePermit(bypassLimit = isHedge)
             val slot = try {
                 pickSlot(last) ?: throw IOException("لا توجد شبكة متاحة")
@@ -491,7 +535,8 @@ class ProxyServer(
             }
             var conn: HttpURLConnection? = null
             try {
-                val (c, _) = requestFollowing(slot.url, slot.net, "bytes=$s-$e")
+                val reqStart = blockStart + curOffset
+                val (c, _) = requestFollowing(slot.url, slot.net, "bytes=$reqStart-$e")
                 conn = c
                 val code = c.responseCode
                 if (code == 429 || code == 503) {
@@ -508,35 +553,36 @@ class ProxyServer(
                 }
                 if (code != 206) throw HttpFailException(code, 0L, "HTTP $code")
 
-                val buf = ByteArray(want)
-                var off = 0
                 c.inputStream.use { ins ->
-                    while (off < want && !stopped && !stopEarly()) {
-                        val n = ins.read(buf, off, want - off)
+                    while (curOffset < blk.expectedSize && !blk.done && !stopped) {
+                        val toRead = minOf(tmp.size, blk.expectedSize - curOffset)
+                        val n = ins.read(tmp, 0, toRead)
                         if (n < 0) break
-                        off += n
+                        if (n > 0) {
+                            val writtenNow = blk.append(tmp, curOffset, n)
+                            curOffset += n
+                            slot.bytes.addAndGet(n.toLong())
+                            if (writtenNow > curOffset + 256 * 1024) {
+                                // المسار الآخر سبقنا بمسافة كبيرة، نحرر هذا الاتصال فورًا
+                                return
+                            }
+                        }
                     }
                 }
-                if (stopEarly()) {
-                    try {
-                        c.disconnect()
-                    } catch (_: Exception) {
-                    }
-                    return null
+                if (blk.done || curOffset >= blk.expectedSize) {
+                    slot.fails = 0
+                    onSuccess()
+                    lastError = ""
+                    return
                 }
                 if (stopped) throw IOException("تم إيقاف السيرفر")
-                if (off < want) throw IOException("انقطاع أثناء السحب")
-                slot.bytes.addAndGet(want.toLong())
-                slot.fails = 0
-                onSuccess()
-                lastError = ""
-                return buf
+                throw IOException("انقطاع أثناء السحب")
             } catch (ex: IOException) {
                 try {
                     conn?.disconnect()
                 } catch (_: Exception) {
                 }
-                if (stopEarly()) return null
+                if (blk.done) return
                 slot.fails = slot.fails + 1
                 if (slot.fails >= 4 && slots.count { !it.dead } > 1) slot.dead = true
                 if (!isHedge) {
@@ -562,29 +608,23 @@ class ProxyServer(
         }
     }
 
-    // ───── كاش الكتل (512 KB) + سحب مسبق ذكي + إنقاذ الكتل المتأخرة ─────
-    private val blockSize = 512 * 1024
-    private val maxBlocks = 96
-    private val ahead = minOf(conns * 2, 24)
+    // ───── كاش الكتل (2 MB) ببث فوري ─────
+    private val blockSize = 2 * 1024 * 1024
+    private val maxBlocks = 32
+    private val ahead = minOf(conns, 10)
 
-    private class Block(val idx: Long) {
-        val fut = CompletableFuture<ByteArray>()
-        val hedged = AtomicBoolean(false)
-        val pendingAttempts = AtomicInteger(0)
+    private val blocks = ConcurrentHashMap<Long, StreamBlock>()
 
-        @Volatile
-        var touched: Long = System.nanoTime()
-    }
-
-    private val blocks = ConcurrentHashMap<Long, Block>()
-
-    private fun getBlock(idx: Long): Block {
+    private fun getBlock(idx: Long): StreamBlock {
         var b = blocks[idx]
         if (b == null) {
-            val nb = Block(idx)
+            val size = origin?.size ?: 0L
+            val s = idx * blockSize
+            val expected = minOf(blockSize.toLong(), size - s).toInt().coerceAtLeast(1)
+            val nb = StreamBlock(idx, expected)
             val prev = blocks.putIfAbsent(idx, nb)
             if (prev == null) {
-                startFetch(nb, isHedge = false)
+                startFetch(nb, isHedge = false, startOffsetInBlock = 0)
                 b = nb
             } else {
                 b = prev
@@ -594,32 +634,24 @@ class ProxyServer(
         return b
     }
 
-    private fun startFetch(b: Block, isHedge: Boolean) {
-        val size = origin?.size ?: 0L
-        val s = b.idx * blockSize
-        val e = minOf(s + blockSize - 1, size - 1)
-        b.pendingAttempts.incrementAndGet()
+    private fun startFetch(b: StreamBlock, isHedge: Boolean, startOffsetInBlock: Int) {
+        b.activeAttempts.incrementAndGet()
         try {
             fetchPool.execute(
                 FetchTask(b.idx, isHedge) {
                     try {
-                        val data = fetchChunk(s, e, isHedge) { b.fut.isDone }
-                        if (data != null) b.fut.complete(data)
-                        b.pendingAttempts.decrementAndGet()
+                        fetchIntoBlock(b, startOffsetInBlock, isHedge)
+                        b.activeAttempts.decrementAndGet()
                     } catch (t: Throwable) {
-                        if (b.pendingAttempts.decrementAndGet() <= 0 && !b.fut.isDone) {
-                            if (!stopped) lastError = t.message ?: t.javaClass.simpleName
-                            blocks.remove(b.idx, b)
-                            b.fut.completeExceptionally(t)
-                        }
+                        if (!stopped) lastError = t.message ?: t.javaClass.simpleName
+                        b.failIfLast(t)
+                        if (b.error != null) blocks.remove(b.idx, b)
                     }
                 }
             )
         } catch (ex: Exception) {
-            if (b.pendingAttempts.decrementAndGet() <= 0 && !b.fut.isDone) {
-                blocks.remove(b.idx, b)
-                b.fut.completeExceptionally(ex)
-            }
+            b.failIfLast(ex)
+            if (b.error != null) blocks.remove(b.idx, b)
         }
     }
 
@@ -627,7 +659,7 @@ class ProxyServer(
         if (blocks.size <= maxBlocks) return
         synchronized(blocks) {
             var excess = blocks.size - maxBlocks
-            val done = blocks.values.filter { it.fut.isDone }.sortedBy { it.touched }
+            val done = blocks.values.filter { it.done }.sortedBy { it.touched }
             for (d in done) {
                 if (excess <= 0) break
                 blocks.remove(d.idx, d)
@@ -644,33 +676,38 @@ class ProxyServer(
             val idx = pos / blockSize
             val blk = getBlock(idx)
             if (end - pos + 1 > 128L * 1024) {
-                val lookAhead = minOf(ahead, effectiveMax.get() * 2)
+                val lookAhead = minOf(ahead, effectiveMax.get())
                 var k = 1L
                 while (k <= lookAhead && idx + k <= lastBlock) {
                     getBlock(idx + k)
                     k++
                 }
             }
-            val data = try {
-                try {
-                    blk.fut.get(1500, TimeUnit.MILLISECONDS)
-                } catch (_: TimeoutException) {
-                    if (!blk.fut.isDone && blk.hedged.compareAndSet(false, true)) {
-                        startFetch(blk, isHedge = true)
-                    }
-                    blk.fut.get()
-                }
-            } catch (ex: Exception) {
-                throw IOException(ex.cause?.message ?: ex.message ?: "فشل السحب")
-            }
             val blockStart = idx * blockSize
-            val from = (pos - blockStart).toInt()
-            val lastByte = minOf(end, blockStart + data.size - 1)
-            val to = (lastByte - blockStart).toInt()
-            out.write(data, from, to - from + 1)
-            served.addAndGet((to - from + 1).toLong())
-            pos = lastByte + 1
-            if (lastByte == blockStart + data.size - 1) blocks.remove(idx, blk)
+            val blockEndByte = minOf(end, blockStart + blk.expectedSize - 1)
+            val needEndInBlock = (blockEndByte - blockStart + 1).toInt()
+            var posInBlock = (pos - blockStart).toInt()
+
+            while (posInBlock < needEndInBlock && !stopped) {
+                var avail = blk.awaitAvailable(posInBlock, 2000L)
+                if (avail <= posInBlock && !blk.done && !stopped) {
+                    if (blk.hedged.compareAndSet(false, true)) {
+                        startFetch(blk, isHedge = true, startOffsetInBlock = blk.written)
+                    }
+                    avail = blk.awaitAvailable(posInBlock, 6000L)
+                }
+                if (avail > posInBlock) {
+                    val writeTo = minOf(avail, needEndInBlock)
+                    val count = writeTo - posInBlock
+                    out.write(blk.data, posInBlock, count)
+                    served.addAndGet(count.toLong())
+                    posInBlock = writeTo
+                    pos += count
+                } else if (blk.done) {
+                    break
+                }
+            }
+            if (posInBlock >= blk.expectedSize) blocks.remove(idx, blk)
             trim()
         }
     }
@@ -681,7 +718,7 @@ class ProxyServer(
         val (c, _) = requestFollowing(slot.url, slot.net, null)
         try {
             c.inputStream.use { ins ->
-                val buf = ByteArray(256 * 1024)
+                val buf = ByteArray(64 * 1024)
                 while (!stopped) {
                     val n = ins.read(buf)
                     if (n < 0) break
