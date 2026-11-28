@@ -1655,7 +1655,7 @@ fun InstallScreen(state: AppState) {
             if (state.proxyRunning) {
                 val v = state.proxyView
                 val frac = if (v.total > 0) (v.served.toFloat() / v.total).coerceIn(0f, 1f) else 0f
-                val eta = if (v.speed > 0 && v.total > v.served) (v.total - v.served) / v.speed else 0L
+                val eta = if (v.speed >= 100 * 1024 && v.total > v.served) (v.total - v.served) / v.speed else 0L
                 GlassCard {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(Modifier.size(8.dp).clip(CircleShape).background(Good))
@@ -1702,18 +1702,34 @@ fun InstallScreen(state: AppState) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            if (v.speed > 0) fmtSize(v.speed) + "/ث" else "0",
+                            if (v.speed >= 1024) fmtSize(v.speed) + "/s" else "—",
                             color = TextHi,
                             fontSize = 20.sp,
-                            fontWeight = FontWeight.ExtraBold
+                            fontWeight = FontWeight.ExtraBold,
+                            style = TextStyle(textDirection = TextDirection.Content)
                         )
-                        Text(if (eta > 0) "المتبقي " + fmtEta(eta) else "", color = TextLo, fontSize = 13.sp)
+                        Text(
+                            if (eta > 0) "المتبقي " + fmtEta(eta) else "",
+                            color = TextLo,
+                            fontSize = 13.sp,
+                            style = TextStyle(textDirection = TextDirection.Content)
+                        )
                     }
                     Text(
                         "${fmtSize(v.served)} / ${fmtSize(v.total)} · ${v.nets}",
                         color = TextLo,
-                        fontSize = 12.sp
+                        fontSize = 12.sp,
+                        style = TextStyle(textDirection = TextDirection.Content)
                     )
+                    if (v.served < 5L * 1024 * 1024 && v.speed < 1024) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "بانتظار الـ PS4 يبدأ السحب… شوف إشعارات الجهاز (التنزيلات). المرحلة الأولى قد تأخذ شوية.",
+                            color = Amber,
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp
+                        )
+                    }
                     if (v.total > 0 && v.served >= v.total) {
                         Spacer(Modifier.height(6.dp))
                         Text("اكتمل النقل ✓ تكدر توقف السيرفر.", color = Good, fontSize = 12.sp)
