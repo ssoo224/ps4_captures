@@ -36,7 +36,7 @@ fun postInstall(ip: String, port: Int, url: String): InstallResult {
     val conn = URL("http://$ip:$port/api/install").openConnection() as HttpURLConnection
     try {
         conn.connectTimeout = 4000
-        conn.readTimeout = 20000
+        conn.readTimeout = 120000
         conn.requestMethod = "POST"
         conn.doOutput = true
         conn.setRequestProperty("Content-Type", "application/json")
@@ -96,6 +96,9 @@ class ProxyServer(
     private var server: ServerSocket? = null
 
     val served = AtomicLong(0)
+    val requests = AtomicLong(0)
+
+    @Volatile var lastError: String = ""
 
     @Volatile var origin: OriginInfo? = null
 
@@ -266,9 +269,11 @@ class ProxyServer(
                         headers[l.substring(0, idx).trim().lowercase(Locale.US)] = l.substring(idx + 1).trim()
                     }
                 }
+                requests.incrementAndGet()
                 if (!respond(method, headers, out)) break
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (!stopped) lastError = e.message ?: e.javaClass.simpleName
         } finally {
             try {
                 sock.close()
@@ -428,6 +433,7 @@ class ProxyServer(
                 try {
                     b.fut.complete(fetchChunk(s, e))
                 } catch (t: Throwable) {
+                    lastError = t.message ?: t.javaClass.simpleName
                     blocks.remove(b.idx, b)
                     b.fut.completeExceptionally(t)
                 }

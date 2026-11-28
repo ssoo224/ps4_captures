@@ -162,7 +162,9 @@ data class ProxyView(
     val served: Long = 0,
     val total: Long = 0,
     val speed: Long = 0,
-    val nets: String = ""
+    val nets: String = "",
+    val requests: Long = 0,
+    val error: String = ""
 )
 
 class MainActivity : ComponentActivity() {
@@ -233,6 +235,7 @@ class AppState(private val ctx: Context) {
     var installBusy by mutableStateOf(false)
     var installOk by mutableStateOf<Boolean?>(null)
     var installMsg by mutableStateOf<String?>(null)
+    var installWarn by mutableStateOf(false)
     var proxyRunning by mutableStateOf(false)
     var proxyView by mutableStateOf(ProxyView())
 
@@ -403,7 +406,10 @@ class AppState(private val ctx: Context) {
                 ema = if (ema == 0.0) inst else ema * 0.7 + inst * 0.3
                 last = served
                 lastT = now
-                proxyView = ProxyView(srv.origin?.name ?: "", served, srv.total, ema.toLong(), srv.liveLabels())
+                proxyView = ProxyView(
+                    srv.origin?.name ?: "", served, srv.total, ema.toLong(), srv.liveLabels(),
+                    srv.requests.get(), srv.lastError
+                )
             }
         }
     }
@@ -420,17 +426,30 @@ class AppState(private val ctx: Context) {
         val port = installPort.toIntOrNull() ?: 12800
         installBusy = true
         installOk = null
+        installWarn = false
         installMsg = null
         scope.launch {
             try {
                 bindWifi()
                 val target = if (mode == 0) url else startProxy(s.ip, url)
+                var timedOut = false
                 val r = try {
                     withContext(Dispatchers.IO) { postInstall(s.ip, port, target) }
                 } catch (e: java.net.ConnectException) {
                     null
+                } catch (e: java.net.SocketTimeoutException) {
+                    timedOut = true
+                    null
                 }
-                if (r == null) {
+                if (r == null && timedOut) {
+                    // الـ PS4 ما رد لحد الآن (غالبًا يحضّر الملف). نخلي السيرفر شغّال ولا نقتله.
+                    installOk = true
+                    installWarn = true
+                    installMsg = if (mode == 1)
+                        "الـ PS4 ما رد على الأمر لحد الآن، وقد يكون مشغولًا بتحضير اللعبة. السيرفر باقي شغّال: راقب إشعارات الجهاز وعدّاد الطلبات بالأسفل."
+                    else
+                        "الـ PS4 ما رد على الأمر لحد الآن. راقب إشعارات الجهاز."
+                } else if (r == null) {
                     stopProxy()
                     installOk = false
                     installMsg = "أداة التثبيت مو شغّالة على المنفذ $port. افتحها على الـ PS4 وأعد المحاولة."
@@ -1631,7 +1650,7 @@ fun InstallScreen(state: AppState) {
             val ok = state.installOk
             val msg = state.installMsg
             if (ok != null && msg != null) {
-                val c = if (ok) Good else Bad
+                val c = if (state.installWarn) Amber else if (ok) Good else Bad
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -1642,7 +1661,7 @@ fun InstallScreen(state: AppState) {
                     verticalAlignment = Alignment.Top
                 ) {
                     Icon(
-                        if (ok) Icons.Rounded.Check else Icons.Rounded.ErrorOutline,
+                        if (state.installWarn) Icons.Rounded.Info else if (ok) Icons.Rounded.Check else Icons.Rounded.ErrorOutline,
                         null,
                         tint = c,
                         modifier = Modifier.size(22.dp)
@@ -1721,6 +1740,19 @@ fun InstallScreen(state: AppState) {
                         fontSize = 12.sp,
                         style = TextStyle(textDirection = TextDirection.Content)
                     )
+                    Text(
+                        "طلبات الـ PS4 للسيرفر: ${v.requests}",
+                        color = TextLo,
+                        fontSize = 12.sp
+                    )
+                    if (v.error.isNotEmpty()) {
+                        Text(
+                            "آخر خطأ: ${v.error}",
+                            color = Bad,
+                            fontSize = 11.sp,
+                            style = TextStyle(textDirection = TextDirection.Content)
+                        )
+                    }
                     if (v.served < 5L * 1024 * 1024 && v.speed < 1024) {
                         Spacer(Modifier.height(6.dp))
                         Text(
