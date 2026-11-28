@@ -101,7 +101,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -155,7 +154,7 @@ private val TextLo = Color(0xFF93A0C8)
 /** رابط مشارك من تطبيق آخر (مشاركة ← PS4 Captures) */
 var pendingShared by mutableStateOf<String?>(null)
 
-val CONN_OPTIONS = listOf(8, 16, 24, 32)
+val CONN_OPTIONS = listOf(4, 6, 8, 16)
 
 data class ProxyView(
     val name: String = "",
@@ -393,21 +392,25 @@ class AppState(private val ctx: Context) {
     private fun startPoll() {
         pollJob?.cancel()
         pollJob = scope.launch {
-            var last = 0L
-            var lastT = SystemClock.elapsedRealtime()
-            var ema = 0.0
+            val history = ArrayDeque<Pair<Long, Long>>()
             while (proxyRunning) {
                 delay(500)
                 val srv = proxy ?: break
                 val served = srv.served.get()
                 val now = SystemClock.elapsedRealtime()
-                val dt = (now - lastT).coerceAtLeast(1)
-                val inst = (served - last) * 1000.0 / dt
-                ema = if (ema == 0.0) inst else ema * 0.7 + inst * 0.3
-                last = served
-                lastT = now
+                history.addLast(now to served)
+                while (history.size > 2 && now - history.first().first > 4000L) {
+                    history.removeFirst()
+                }
+                val first = history.first()
+                val dt = (now - first.first).coerceAtLeast(1)
+                val speed = if (history.size >= 2) {
+                    ((served - first.second) * 1000.0 / dt).toLong().coerceAtLeast(0L)
+                } else {
+                    0L
+                }
                 proxyView = ProxyView(
-                    srv.origin?.name ?: "", served, srv.total, ema.toLong(), srv.liveLabels(),
+                    srv.origin?.name ?: "", served, srv.total, speed, srv.liveLabels(),
                     srv.requests.get(), srv.lastError
                 )
             }
@@ -870,7 +873,6 @@ fun ConnectScreen(state: AppState) {
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
-            .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 22.dp),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -881,7 +883,10 @@ fun ConnectScreen(state: AppState) {
             Box(
                 Modifier
                     .size(140.dp)
-                    .scale(glow)
+                    .graphicsLayer {
+                        scaleX = glow
+                        scaleY = glow
+                    }
                     .clip(CircleShape)
                     .background(Brush.radialGradient(listOf(Accent.copy(alpha = 0.38f), Color.Transparent)))
             )
@@ -1017,6 +1022,7 @@ fun ConnectScreen(state: AppState) {
             textAlign = TextAlign.Center
         )
         Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.imePadding())
     }
 }
 
@@ -1428,7 +1434,6 @@ fun Viewer(state: AppState, item: Capture) {
     }
 }
 
-
 fun fmtEta(sec: Long): String {
     val h = sec / 3600
     val m = (sec % 3600) / 60
@@ -1502,7 +1507,6 @@ fun InstallScreen(state: AppState) {
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
-            .imePadding()
             .verticalScroll(rememberScrollState())
     ) {
         Row(
@@ -1671,104 +1675,109 @@ fun InstallScreen(state: AppState) {
                 }
             }
 
-            if (state.proxyRunning) {
-                val v = state.proxyView
-                val frac = if (v.total > 0) (v.served.toFloat() / v.total).coerceIn(0f, 1f) else 0f
-                val eta = if (v.speed >= 100 * 1024 && v.total > v.served) (v.total - v.served) / v.speed else 0L
-                GlassCard {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(8.dp).clip(CircleShape).background(Good))
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            "السيرفر الوسيط شغّال",
-                            color = Good,
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = 13.sp,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Box(
-                            Modifier
-                                .clip(RoundedCornerShape(50))
-                                .border(1.dp, Bad.copy(alpha = 0.5f), RoundedCornerShape(50))
-                                .clickable { state.stopProxy() }
-                                .padding(horizontal = 14.dp, vertical = 6.dp)
-                        ) {
-                            Text("إيقاف", color = Bad, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        }
-                    }
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        v.name,
-                        color = TextHi,
-                        fontSize = 12.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.fillMaxWidth(),
-                        textAlign = TextAlign.Start,
-                        style = TextStyle(textDirection = TextDirection.Ltr)
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    LinearProgressIndicator(
-                        progress = { frac },
-                        modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(50)),
-                        color = Accent,
-                        trackColor = Color.White.copy(alpha = 0.12f)
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            if (v.speed >= 1024) fmtSize(v.speed) + "/s" else "—",
-                            color = TextHi,
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.ExtraBold,
-                            style = TextStyle(textDirection = TextDirection.Content)
-                        )
-                        Text(
-                            if (eta > 0) "المتبقي " + fmtEta(eta) else "",
-                            color = TextLo,
-                            fontSize = 13.sp,
-                            style = TextStyle(textDirection = TextDirection.Content)
-                        )
-                    }
-                    Text(
-                        "${fmtSize(v.served)} / ${fmtSize(v.total)} · ${v.nets}",
-                        color = TextLo,
-                        fontSize = 12.sp,
-                        style = TextStyle(textDirection = TextDirection.Content)
-                    )
-                    Text(
-                        "طلبات الـ PS4 للسيرفر: ${v.requests}",
-                        color = TextLo,
-                        fontSize = 12.sp
-                    )
-                    if (v.error.isNotEmpty()) {
-                        Text(
-                            "آخر خطأ: ${v.error}",
-                            color = Bad,
-                            fontSize = 11.sp,
-                            style = TextStyle(textDirection = TextDirection.Content)
-                        )
-                    }
-                    if (v.served < 5L * 1024 * 1024 && v.speed < 1024) {
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            "بانتظار الـ PS4 يبدأ السحب… شوف إشعارات الجهاز (التنزيلات). المرحلة الأولى قد تأخذ شوية.",
-                            color = Amber,
-                            fontSize = 12.sp,
-                            lineHeight = 18.sp
-                        )
-                    }
-                    if (v.total > 0 && v.served >= v.total) {
-                        Spacer(Modifier.height(6.dp))
-                        Text("اكتمل النقل ✓ تكدر توقف السيرفر.", color = Good, fontSize = 12.sp)
-                    }
-                }
-            }
+            ProxyStatusCard(state)
             Spacer(Modifier.height(28.dp))
+            Spacer(Modifier.imePadding())
+        }
+    }
+}
+
+@Composable
+private fun ProxyStatusCard(state: AppState) {
+    if (!state.proxyRunning) return
+    val v = state.proxyView
+    val frac = if (v.total > 0) (v.served.toFloat() / v.total).coerceIn(0f, 1f) else 0f
+    val eta = if (v.speed >= 100 * 1024 && v.total > v.served) (v.total - v.served) / v.speed else 0L
+    GlassCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(8.dp).clip(CircleShape).background(Good))
+            Spacer(Modifier.width(6.dp))
+            Text(
+                "السيرفر الوسيط شغّال",
+                color = Good,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 13.sp,
+                modifier = Modifier.weight(1f)
+            )
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(50))
+                    .border(1.dp, Bad.copy(alpha = 0.5f), RoundedCornerShape(50))
+                    .clickable { state.stopProxy() }
+                    .padding(horizontal = 14.dp, vertical = 6.dp)
+            ) {
+                Text("إيقاف", color = Bad, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            v.name,
+            color = TextHi,
+            fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.fillMaxWidth(),
+            textAlign = TextAlign.Start,
+            style = TextStyle(textDirection = TextDirection.Ltr)
+        )
+        Spacer(Modifier.height(10.dp))
+        LinearProgressIndicator(
+            progress = { frac },
+            modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(50)),
+            color = Accent,
+            trackColor = Color.White.copy(alpha = 0.12f)
+        )
+        Spacer(Modifier.height(10.dp))
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                if (v.speed >= 1024) fmtSize(v.speed) + "/s" else "—",
+                color = TextHi,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.ExtraBold,
+                style = TextStyle(textDirection = TextDirection.Content)
+            )
+            Text(
+                if (eta > 0) "المتبقي " + fmtEta(eta) else "",
+                color = TextLo,
+                fontSize = 13.sp,
+                style = TextStyle(textDirection = TextDirection.Content)
+            )
+        }
+        Text(
+            "${fmtSize(v.served)} / ${fmtSize(v.total)} · ${v.nets}",
+            color = TextLo,
+            fontSize = 12.sp,
+            style = TextStyle(textDirection = TextDirection.Content)
+        )
+        Text(
+            "طلبات الـ PS4 للسيرفر: ${v.requests}",
+            color = TextLo,
+            fontSize = 12.sp
+        )
+        if (v.error.isNotEmpty()) {
+            Text(
+                "آخر خطأ: ${v.error}",
+                color = Bad,
+                fontSize = 11.sp,
+                style = TextStyle(textDirection = TextDirection.Content)
+            )
+        }
+        if (v.served < 5L * 1024 * 1024 && v.speed < 1024) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "بانتظار الـ PS4 يبدأ السحب… شوف إشعارات الجهاز (التنزيلات). المرحلة الأولى قد تأخذ شوية.",
+                color = Amber,
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+        }
+        if (v.total > 0 && v.served >= v.total) {
+            Spacer(Modifier.height(6.dp))
+            Text("اكتمل النقل ✓ تكدر توقف السيرفر.", color = Good, fontSize = 12.sp)
         }
     }
 }

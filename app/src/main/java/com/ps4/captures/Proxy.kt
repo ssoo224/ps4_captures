@@ -20,7 +20,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.PriorityBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
@@ -111,7 +110,7 @@ private class StreamBlock(val idx: Long, val expectedSize: Int) {
     @Volatile var done = false
     @Volatile var error: Throwable? = null
     @Volatile var touched = System.nanoTime()
-    val hedged = AtomicBoolean(false)
+    val lastHedgeAtMs = AtomicLong(0L)
     val activeAttempts = AtomicInteger(0)
 
     fun append(buf: ByteArray, offsetInBlock: Int, len: Int): Int = lock.withLock {
@@ -149,7 +148,7 @@ private class StreamBlock(val idx: Long, val expectedSize: Int) {
 
 /**
  * سيرفر HTTP صغير على التلفون: الـ PS4 يطلب منه الملف، والتلفون يسحبه من الإنترنت
- * بعدة اتصالات متوازية ويبثه للـ PS4 تدريجيًا فورًا بأعلى ثبات.
+ * بكتل متوازية مركّزة (4MB) وبث فوري كل 32KB مع إنقاذ تلقائي وتجديد للروابط المنتهية.
  */
 class ProxyServer(
     private val conns: Int,
@@ -214,7 +213,7 @@ class ProxyServer(
         c.instanceFollowRedirects = false
         c.requestMethod = method
         c.connectTimeout = 6000
-        c.readTimeout = 6000
+        c.readTimeout = 7000
         c.setRequestProperty(
             "User-Agent",
             "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
@@ -378,7 +377,7 @@ class ProxyServer(
     private fun handle(sock: Socket) {
         try {
             sock.tcpNoDelay = true
-            sock.sendBufferSize = 1 shl 20
+            sock.sendBufferSize = 512 * 1024
             sock.soTimeout = 120000
             val ins = sock.getInputStream().buffered(16 * 1024)
             val out = sock.getOutputStream()
@@ -487,8 +486,8 @@ class ProxyServer(
     private fun onSuccess() {
         val streak = okStreak.incrementAndGet()
         val cur = effectiveMax.get()
-        if (cur < conns && streak >= 12) {
-            effectiveMax.compareAndSet(cur, minOf(conns, cur + 2))
+        if (cur < conns && streak >= 10) {
+            effectiveMax.compareAndSet(cur, minOf(conns, cur + 1))
             okStreak.set(0)
         }
     }
@@ -496,8 +495,8 @@ class ProxyServer(
     private fun onThrottle() {
         okStreak.set(0)
         val cur = effectiveMax.get()
-        if (cur > 4) {
-            effectiveMax.compareAndSet(cur, maxOf(4, (cur * 0.7).toInt()))
+        if (cur > 3) {
+            effectiveMax.compareAndSet(cur, maxOf(3, (cur * 0.75).toInt()))
         }
     }
 
@@ -534,6 +533,7 @@ class ProxyServer(
                 throw ex
             }
             var conn: HttpURLConnection? = null
+            var completedCleanly = false
             try {
                 val reqStart = blockStart + curOffset
                 val (c, _) = requestFollowing(slot.url, slot.net, "bytes=$reqStart-$e")
@@ -563,13 +563,13 @@ class ProxyServer(
                             curOffset += n
                             slot.bytes.addAndGet(n.toLong())
                             if (writtenNow > curOffset + 256 * 1024) {
-                                // المسار الآخر سبقنا بمسافة كبيرة، نحرر هذا الاتصال فورًا
                                 return
                             }
                         }
                     }
                 }
                 if (blk.done || curOffset >= blk.expectedSize) {
+                    completedCleanly = true
                     slot.fails = 0
                     onSuccess()
                     lastError = ""
@@ -578,10 +578,6 @@ class ProxyServer(
                 if (stopped) throw IOException("تم إيقاف السيرفر")
                 throw IOException("انقطاع أثناء السحب")
             } catch (ex: IOException) {
-                try {
-                    conn?.disconnect()
-                } catch (_: Exception) {
-                }
                 if (blk.done) return
                 slot.fails = slot.fails + 1
                 if (slot.fails >= 4 && slots.count { !it.dead } > 1) slot.dead = true
@@ -602,16 +598,22 @@ class ProxyServer(
                 }
                 Thread.sleep(sleepMs)
             } finally {
+                if (!completedCleanly) {
+                    try {
+                        conn?.disconnect()
+                    } catch (_: Exception) {
+                    }
+                }
                 synchronized(slots) { slot.inflight = maxOf(0, slot.inflight - 1) }
                 releasePermit()
             }
         }
     }
 
-    // ───── كاش الكتل (2 MB) ببث فوري ─────
-    private val blockSize = 2 * 1024 * 1024
-    private val maxBlocks = 32
-    private val ahead = minOf(conns, 10)
+    // ───── كاش الكتل (4 MB) ببث فوري + سحب مسبق مركز (حتى 3 كتل) ─────
+    private val blockSize = 4 * 1024 * 1024
+    private val maxBlocks = 16
+    private val ahead = minOf(conns, 3)
 
     private val blocks = ConcurrentHashMap<Long, StreamBlock>()
 
@@ -691,10 +693,15 @@ class ProxyServer(
             while (posInBlock < needEndInBlock && !stopped) {
                 var avail = blk.awaitAvailable(posInBlock, 2000L)
                 if (avail <= posInBlock && !blk.done && !stopped) {
-                    if (blk.hedged.compareAndSet(false, true)) {
+                    val nowMs = System.currentTimeMillis()
+                    val prevHedge = blk.lastHedgeAtMs.get()
+                    if (nowMs - prevHedge >= 2500L &&
+                        blk.activeAttempts.get() < 2 &&
+                        blk.lastHedgeAtMs.compareAndSet(prevHedge, nowMs)
+                    ) {
                         startFetch(blk, isHedge = true, startOffsetInBlock = blk.written)
                     }
-                    avail = blk.awaitAvailable(posInBlock, 6000L)
+                    avail = blk.awaitAvailable(posInBlock, 4000L)
                 }
                 if (avail > posInBlock) {
                     val writeTo = minOf(avail, needEndInBlock)
